@@ -1,0 +1,5 @@
+# Pargres extension
+comment = 'Parallel Query execution module [Prototype]'
+default_version = '0.1'
+module_pathname = '$libdir/pargres'
+relocatable = false
