@@ -12,5 +12,4 @@ do
 	echo "pgdata_dir: $pgdata_dir, port: $port"
 	pg_ctl -D $pgdata_dir -o "-p $port" stop
 	rm -rf $pgdata_dir
-	rm logfile$node
 done
