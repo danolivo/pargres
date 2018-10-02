@@ -1,2 +1,2 @@
 # pargres
-Extension on PostgreSQL for parallel query execution
+[Prototype] Extension on PostgreSQL for parallel query execution in shared-nothing hardware architectures.
