@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "Starting all postgres instances..."
+echo "Send Query to all postgres instances..."
 
 . ./paths.sh
 

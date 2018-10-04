@@ -11,5 +11,4 @@ do
 	port=$((5433+$node))
 	echo "pgdata_dir: $pgdata_dir, port: $port"
 	pg_ctl -D $pgdata_dir -o "-p $port" stop
-	rm -rf $pgdata_dir
 done
