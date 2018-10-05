@@ -12,11 +12,11 @@
 #include "nodes/extensible.h"
 #include "optimizer/planner.h"
 
-typedef int (*fragmentation_fn_t) (int value, int nnodes);
+typedef int (*fragmentation_fn_t) (int value, int mynum, int nnodes);
 
 typedef enum
 {
-	FR_FUNC_DEFAULT = 0
+	FR_FUNC_DEFAULT = 0,
 } fr_func_id;
 
 typedef struct
@@ -27,11 +27,23 @@ typedef struct
 
 typedef struct
 {
-	CustomScanState		css;
-	Plan				*subplan;
+	fr_options_t	frOpts;
+	bool			drop_duplicates;
+	int				mynode;
+	int				nnodes;
+} ExchangePrivateData;
+
+typedef struct
+{
+	CustomScanState	css;
+	Plan			*subplan;
+	fr_options_t	frOpts;
+	bool			drop_duplicates;
+	int				mynode;
+	int				nnodes;
 } ExchangeState;
 
-extern void EXCHANGE_Hooks(void);
-extern Plan *make_exchange(Plan *subplan, fr_options_t frOpts);
+extern void EXCHANGE_Init(void);
+extern Plan *make_exchange(Plan *subplan, fr_options_t frOpts, bool drop_duplicates, int mynode, int nnodes);
 
 #endif /* EXCHANGE_H_ */

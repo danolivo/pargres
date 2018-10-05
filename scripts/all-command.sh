@@ -7,6 +7,6 @@ echo "Send Query to all postgres instances..."
 for (( node=0; node<$1; node++ ))
 do
 	port=$((5433+$node))
-	echo "Send Query '$2' to node: $node, port: $port"
-	psql -p $port -c "$2"
+	echo "Send command '$2' to node: $node, port: $port"
+	$2 -p $port
 done

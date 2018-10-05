@@ -38,16 +38,18 @@ int			nfrRelations = 0;
 FragRels	frRelations[1000];
 
 /* Name of relation with fragmentation options */
-#define RELATIONS_FRAG_CONFIG	"relsfrag"
+#define RELATIONS_FRAG_CONFIG		"relsfrag"
+//#define RELATIONS_PARGRES_CONFIG	"pargres_config"
 
 static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
 static planner_hook_type		prev_planner_hook = NULL;
 
 static PlannedStmt *planner_insert_exchange(Query *parse, int cursorOptions,
 											ParamListInfo boundParams);
-static int fragmentation_fn_default(int value, int nnodes);
 
-static void change_plan(Plan *plan, fr_options_t frOpts);
+static void changeModifyTablePlan(Plan *plan, PlannedStmt *stmt,
+								  fr_options_t innerFrOpts,
+								  fr_options_t outerFrOpts);
 static void create_table_frag(const char *relname, int attno, fr_func_id fid);
 static void load_description_frag(void);
 
@@ -56,12 +58,6 @@ static void load_description_frag(void);
  */
 static int node_number;
 static int nodes_at_cluster;
-
-static int
-fragmentation_fn_default(int value, int nnodes)
-{
-	return value%nnodes;
-}
 
 #define NODES_MAX_NUM	(1024)
 
@@ -93,17 +89,6 @@ set_sequence_options(CreateSeqStmt *seq, int nnum)
 						  makeDefElem("start", (Node *) makeFloat(psprintf(INT64_FORMAT, base)), -1));
 }
 
-//static void
-//add_table_fragmentation(CreateStmt *stmt)
-//{
-//	StrNCpy(frRelations[nfrRelations].relname, stmt->relation->relname, NAMEDATALEN);
-//	frRelations[nfrRelations].relid = InvalidOid;
-//	frRelations[nfrRelations].frOpts.attno = 13;
-//	frRelations[nfrRelations].frOpts.func = fragmentation_fn_default;
-//	nfrRelations++;
-//	elog(LOG, "add_table_fragmentation: nfrRelations=%d", nfrRelations);
-//}
-
 /*
  * ParGRES_Utility_hooking
  *
@@ -125,7 +110,7 @@ ParGRES_Utility_hooking(PlannedStmt *pstmt,
 	switch (nodeTag(parsetree))
 	{
 	case T_CreateSeqStmt: /* CREATE SEQUENCE */
-		set_sequence_options((CreateSeqStmt *) parsetree, node_number);
+//		set_sequence_options((CreateSeqStmt *) parsetree, node_number);
 		break;
 	case T_CreateStmt: /* CREATE TABLE */
 		create_table_frag(((CreateStmt *)parsetree)->relation->relname,
@@ -189,7 +174,7 @@ get_fragmentation(Oid relid)
 			elog(LOG, "Relation %s (relid=%d) not distributed!", relname, relid);
 		else
 		{
-			elog(LOG, "Distribution relid=%d found!", relid);
+//			elog(LOG, "Distribution relid=%d found!", relid);
 			if (frRelations[i].relid == InvalidOid)
 				frRelations[i].relid = relid;
 			result = frRelations[i].frOpts;
@@ -244,10 +229,11 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 	switch (nodeTag(root))
 	{
 	case T_ModifyTable:
-		change_plan(root, outerFrOpts);
+		changeModifyTablePlan(root, stmt, innerFrOpts, outerFrOpts);
 		break;
 	case T_SeqScan:
 		relid = getrelid(((SeqScan *)root)->scanrelid, stmt->rtable);
+//		elog(LOG, "search relid=%d", relid);
 		FrOpts = get_fragmentation(relid);
 		return FrOpts;
 	default:
@@ -265,19 +251,26 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 }
 
 static void
-change_plan(Plan *plan, fr_options_t frOpts)
+changeModifyTablePlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
+													fr_options_t outerFrOpts)
 {
-	ModifyTable	   *modify_table = (ModifyTable *) plan;
-	ListCell	   *lc1;
+	ModifyTable	*modify_table = (ModifyTable *) plan;
+	List		*rangeTable = stmt->rtable;
+	Oid			resultRelationOid;
 
 	/* Skip if not ModifyTable with 'INSERT' command */
 	if (!IsA(modify_table, ModifyTable) || modify_table->operation != CMD_INSERT)
 		return;
-//	elog(LOG, "change plan");
-	foreach (lc1, modify_table->plans)
-	{
-		lfirst(lc1) = make_exchange((Plan *) lfirst(lc1), frOpts);
-	}
+
+	/* Simple way for prototype only*/
+	Assert(list_length(modify_table->resultRelations) == 1);
+	resultRelationOid = getrelid(linitial_int(stmt->resultRelations),
+																	rangeTable);
+	Assert(list_length(modify_table->plans) == 1);
+//elog(LOG, "changeModifyTablePlan: %d %d", node_number, nodes_at_cluster);
+	/* Insert EXCHANGE node as a children of INSERT node */
+	linitial(modify_table->plans) = make_exchange(linitial(modify_table->plans),
+			get_fragmentation(resultRelationOid), true, node_number, nodes_at_cluster);
 }
 
 PlannedStmt *
@@ -335,7 +328,7 @@ _PG_init(void)
 	next_ProcessUtility_hook = ProcessUtility_hook;
 	ProcessUtility_hook = ParGRES_Utility_hooking;
 
-	EXCHANGE_Hooks();
+	EXCHANGE_Init();
 	planner_hooking();
 }
 
