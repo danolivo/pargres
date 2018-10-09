@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "Stopping all postgres instances..."
+echo "Stopping gently and start postgres instances..."
 
 . ./paths.sh
 
@@ -11,4 +11,5 @@ do
 	port=$((5433+$node))
 	echo "pgdata_dir: $pgdata_dir, port: $port"
 	pg_ctl -D $pgdata_dir -o "-p $port" stop -m smart
+	pg_ctl -c -D $pgdata_dir -l logfile$node -o "-p $port" start
 done

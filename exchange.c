@@ -14,6 +14,7 @@ static void EXCHANGE_Explain(CustomScanState *node, List *ancestors, ExplainStat
 static Node *EXCHANGE_Create_state(CustomScan *node);
 
 static int fragmentation_fn_default(int value, int nnodes, int mynum);
+static int fragmentation_fn_gather(int value, int nodenum, int nnodes);
 static fragmentation_fn_t frFuncs(fr_func_id fid);
 
 
@@ -192,8 +193,15 @@ EXCHANGE_Init(void)
 static int
 fragmentation_fn_default(int value, int mynum, int nnodes)
 {
-	elog(LOG, "value: %d nnodes: %d", value, nnodes);
+//	elog(LOG, "value: %d nnodes: %d", value, nnodes);
 	return value%nnodes;
+}
+
+static int
+fragmentation_fn_gather(int value, int nodenum, int nnodes)
+{
+	Assert((nodenum >= 0) && (nodenum < nnodes));
+	return nodenum;
 }
 
 static int
@@ -209,6 +217,8 @@ frFuncs(fr_func_id fid)
 	{
 	case FR_FUNC_DEFAULT:
 		return fragmentation_fn_default;
+	case FR_FUNC_GATHER:
+		return fragmentation_fn_gather;
 
 	default:
 		elog(LOG, "Undefined function");

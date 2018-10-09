@@ -6,3 +6,13 @@ CREATE TABLE IF NOT EXISTS @extschema@.relsfrag (
 	fr_func_id	INT
 );
 
+--
+-- set_query_id()
+--
+CREATE FUNCTION set_query_id(
+					nodeID	INT, 
+					tag		INT)
+RETURNS VOID
+AS 'MODULE_PATHNAME', 'set_query_id'
+LANGUAGE C STRICT PARALLEL RESTRICTED;
+

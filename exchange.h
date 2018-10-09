@@ -16,7 +16,9 @@ typedef int (*fragmentation_fn_t) (int value, int mynum, int nnodes);
 
 typedef enum
 {
-	FR_FUNC_DEFAULT = 0,
+	FR_FUNC_NINITIALIZED = 0,
+	FR_FUNC_DEFAULT,
+	FR_FUNC_GATHER
 } fr_func_id;
 
 typedef struct
