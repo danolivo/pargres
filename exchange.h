@@ -43,9 +43,17 @@ typedef struct
 	bool			drop_duplicates;
 	int				mynode;
 	int				nnodes;
+	pgsocket		*read_sock; /* incoming messages */
+	pgsocket		*write_sock; /* outcoming messages */
+	bool			NetworkIsActive;
+	bool			LocalStorageIsActive;
+	int				LocalStorageTuple;
+	int				NetworkStorageTuple;
+
 } ExchangeState;
 
-extern void EXCHANGE_Init(void);
+extern void EXCHANGE_Init_methods(void);
 extern Plan *make_exchange(Plan *subplan, fr_options_t frOpts, bool drop_duplicates, int mynode, int nnodes);
+extern fragmentation_fn_t frFuncs(fr_func_id fid);
 
 #endif /* EXCHANGE_H_ */

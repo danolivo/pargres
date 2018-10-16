@@ -9,10 +9,24 @@ CREATE TABLE IF NOT EXISTS @extschema@.relsfrag (
 --
 -- set_query_id()
 --
-CREATE FUNCTION set_query_id(
-					nodeID	INT, 
-					tag		INT)
-RETURNS VOID
+CREATE OR REPLACE FUNCTION @extschema@.set_query_id(
+					nodeID	INT)
+RETURNS INT
 AS 'MODULE_PATHNAME', 'set_query_id'
-LANGUAGE C STRICT PARALLEL RESTRICTED;
+LANGUAGE C STRICT;
 
+--
+-- set_exchange_ports()
+--
+CREATE OR REPLACE FUNCTION @extschema@.set_exchange_ports(
+					ports	TEXT)
+RETURNS VOID
+AS 'MODULE_PATHNAME', 'set_exchange_ports'
+LANGUAGE C STRICT;
+
+CREATE OR REPLACE FUNCTION @extschema@.isLocalValue(
+					relname	TEXT,
+					value	INT)
+RETURNS BOOL
+AS 'MODULE_PATHNAME', 'isLocalValue'
+LANGUAGE C STRICT;

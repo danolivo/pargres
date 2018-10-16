@@ -1,5 +1,7 @@
 #include "postgres.h"
 
+#include "common.h"
+#include "connection.h"
 #include "exchange.h"
 #include "pargres.h"
 
@@ -15,8 +17,29 @@ static Node *EXCHANGE_Create_state(CustomScan *node);
 
 static int fragmentation_fn_default(int value, int nnodes, int mynum);
 static int fragmentation_fn_gather(int value, int nodenum, int nnodes);
-static fragmentation_fn_t frFuncs(fr_func_id fid);
 
+
+void
+EXCHANGE_Init_methods(void)
+{
+	exchange_plan_methods.CustomName 			= "ExchangePlan";
+	exchange_plan_methods.CreateCustomScanState	= EXCHANGE_Create_state;
+
+	/* setup exec methods */
+	exchange_exec_methods.CustomName				= "Exchange";
+	exchange_exec_methods.BeginCustomScan			= EXCHANGE_Begin;
+	exchange_exec_methods.ExecCustomScan			= EXCHANGE_Execute;
+	exchange_exec_methods.EndCustomScan				= EXCHANGE_End;
+	exchange_exec_methods.ReScanCustomScan			= EXCHANGE_Rescan;
+	exchange_exec_methods.MarkPosCustomScan			= NULL;
+	exchange_exec_methods.RestrPosCustomScan		= NULL;
+	exchange_exec_methods.EstimateDSMCustomScan  	= NULL;
+	exchange_exec_methods.InitializeDSMCustomScan 	= NULL;
+	exchange_exec_methods.InitializeWorkerCustomScan= NULL;
+	exchange_exec_methods.ReInitializeDSMCustomScan = NULL;
+	exchange_exec_methods.ShutdownCustomScan		= NULL;
+	exchange_exec_methods.ExplainCustomScan			= EXCHANGE_Explain;
+}
 
 static Node *
 EXCHANGE_Create_state(CustomScan *node)
@@ -24,6 +47,7 @@ EXCHANGE_Create_state(CustomScan *node)
 	ExchangePrivateData	*Data;
 	ExchangeState *state;
 
+//	node->custom_scan_tlist = node->scan.plan.targetlist;
 	state = (ExchangeState *) palloc0(sizeof(ExchangeState));
 	NodeSetTag(state, T_CustomScanState);
 	Data = (ExchangePrivateData *) list_nth(node->custom_private, 0);
@@ -37,9 +61,17 @@ EXCHANGE_Create_state(CustomScan *node)
 	state->drop_duplicates = Data->drop_duplicates;
 	state->mynode = Data->mynode;
 	state->nnodes = Data->nnodes;
-//	elog(LOG, "EXCHANGE_Create_state: %d %d", state->mynode, state->nnodes);
+
+	state->read_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
+	state->write_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
+	CONN_Init_exchange(state->read_sock, state->write_sock);
+
+	/* Add Pointer to private EXCHANGE data to the list */
+	ExchangeNodesPrivate = lappend(ExchangeNodesPrivate, (Node *)state);
+
 	/* There should be exactly one subplan */
 	Assert(list_length(node->custom_plans) == 1);
+	Assert(!node->scan.plan.qual);
 
 	return (Node *) state;
 }
@@ -47,33 +79,122 @@ EXCHANGE_Create_state(CustomScan *node)
 static void
 EXCHANGE_Begin(CustomScanState *node, EState *estate, int eflags)
 {
-	ExchangeState	   *state = (ExchangeState *) node;
+	ExchangeState	*state = (ExchangeState *) node;
+	PlanState		*child_ps;
+	TupleDesc		tupDesc;
 
 	/* It's convenient to store PlanState in 'custom_ps' */
 	node->custom_ps = list_make1(ExecInitNode(state->subplan, estate, eflags));
+	child_ps = (PlanState *) linitial(node->custom_ps);
+	node->ss.ps.plan->targetlist = child_ps->plan->targetlist;
+	outerPlanState(node) = child_ps;
+	tupDesc = ExecGetResultType(outerPlanState(node));
+	Assert(innerPlan(node->ss.ps.plan) == NULL);
+//	if (!node->ss.ps.plan->targetlist)
+//	{
+//		node->ss.ps.ps_ResultTupleSlot = ExecInitExtraTupleSlot(estate, tupDesc);
+//	elog(LOG, "EXCH before natts= %d %d", node->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor->natts, node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts);
+//	elog(LOG, "EXCH list_length=%d", list_length(node->ss.ps.plan->targetlist));
+	node->ss.ss_ScanTupleSlot = ExecInitExtraTupleSlot(estate, tupDesc);
+	node->ss.ps.ps_ResultTupleSlot = ExecInitExtraTupleSlot(estate, tupDesc);
+//	ExecInitResultTupleSlotTL(estate, &node->ss.ps);
+//	ExecConditionalAssignProjectionInfo(&node->ss.ps, tupDesc, OUTER_VAR);
+//		elog(LOG, "Children natts=%d", child_ps->ps_ResultTupleSlot->tts_tupleDescriptor->natts);
+//	}
+
+//
+//	ExecInitResultTupleSlotTL(child_ps->state, &node->ss.ps);
+//	ExecInitScanTupleSlot(child_ps->state, &node->ss, child_ps->ps_ResultTupleSlot->tts_tupleDescriptor);
+
+	//	node->ss.ps.ps_ResultTupleSlot = MakeTupleTableSlot(child_ps->ps_ResultTupleSlot->tts_tupleDescriptor);
+//	elog(LOG, "EXCH Begin: natts=%d %d", node->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor->natts, node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts);
+	state->NetworkIsActive = true;
+	state->LocalStorageIsActive = true;
+	state->NetworkStorageTuple = 0;
+	state->LocalStorageTuple = 0;
+}
+
+//char tbuf[8192];
+
+static TupleTableSlot *
+GetTupleFromNetwork(ExchangeState *state, TupleTableSlot *slot, bool *NetworkIsActive)
+{
+	int res;
+	HeapTuple tuple;
+
+	tuple = CONN_Recv(state->read_sock, &res);
+
+	if (res < 0)
+	{
+//		elog(LOG, "Network off");
+		*NetworkIsActive = false;
+		return ExecClearTuple(slot);
+	}
+	else if (res == 0)
+	{
+		return ExecClearTuple(slot);
+	}
+	else
+	{
+//		elog(LOG, "Tuple Received: t_len=%d", tuple->t_len);
+		ExecStoreHeapTuple(tuple, slot, false);
+		return slot;
+	}
 }
 
 static TupleTableSlot *
 EXCHANGE_Execute(CustomScanState *node)
 {
 	PlanState		*child_ps = (PlanState *) linitial(node->custom_ps);
-	TupleTableSlot	*slot = NULL;
+	TupleTableSlot	*slot = node->ss.ss_ScanTupleSlot;
 	bool			isnull;
 	Datum			value;
 	ExchangeState	*state = (ExchangeState *)node;
 	int				destnode;
+	ExprContext		*econtext;
 
-//	elog(LOG, "EXCHANGE_Execute: %d %d %u %d %d", state->frOpts.attno, state->frOpts.funcId, state->drop_duplicates,
-//			state->mynode, state->nnodes);
+	econtext = state->css.ss.ps.ps_ExprContext;
+	ResetExprContext(econtext);
+
 	for (;;)
 	{
-		fragmentation_fn_t frfunc;
-		int val;
+		fragmentation_fn_t	frfunc;
+		int					val;
 
-		slot = ExecProcNode(child_ps);
+		if (state->NetworkIsActive)
+		{
+			slot = GetTupleFromNetwork(state, node->ss.ss_ScanTupleSlot, &state->NetworkIsActive);
+
+			if (!TupIsNull(slot))
+			{
+				state->NetworkStorageTuple++;
+				break;
+			}
+		}
+
+		if (state->LocalStorageIsActive)
+		{
+			slot = ExecProcNode(child_ps);
+
+			if (TupIsNull(slot))
+			{
+//				elog(LOG, "Close all outcoming connections. CoordinatorNode=%d", CoordinatorNode);
+				CONN_Exchange_close(state->write_sock);
+//				elog(LOG, "Close LocalStorageIsActive: state->NetworkIsActive=%u", state->NetworkIsActive);
+				state->LocalStorageIsActive = false;
+			} else
+				state->LocalStorageTuple++;
+		}
 
 		if (TupIsNull(slot))
-			return NULL;
+		{
+			if (!state->NetworkIsActive && !state->LocalStorageIsActive)
+			{
+				return NULL;
+			}
+			else
+				continue;
+		}
 
 		/* Extract value of cell in a distribution domain */
 		value = slot_getattr(slot, state->frOpts.attno, &isnull);
@@ -84,22 +205,42 @@ EXCHANGE_Execute(CustomScanState *node)
 		val = DatumGetInt32(value);
 
 		destnode = frfunc(val, state->mynode, state->nnodes);
-
+//		elog(LOG, "AFTER Analysis! destnode=%d state->mynode=%d", destnode, state->mynode);
 		if (destnode == state->mynode)
 			break;
 		else if (state->drop_duplicates)
+		{
+//			elog(LOG, "DROP Duplicates!");
 			continue;
+		}
 		else
+		{
+			int tupsize = offsetof(HeapTupleData, t_data);
+//			elog(LOG, "Send Tuple!: tupsize=%d len=%d Oid=%d", tupsize, slot->tts_tuple->t_len, slot->tts_tuple->t_tableOid);
+			CONN_Send(state->write_sock[destnode], slot->tts_tuple, tupsize);
+			CONN_Send(state->write_sock[destnode], slot->tts_tuple->t_data, slot->tts_tuple->t_len);
 			/* ToDo: Send tuple to corresponding destnode exchange */
 			continue;
+		}
 	}
+
 	return slot;
 }
 
 static void
 EXCHANGE_End(CustomScanState *node)
 {
-//	elog(LOG, "I am in EXCHANGE_End()!");
+//	ExchangeState	*state = (ExchangeState *)node;
+
+//	elog(LOG, "END Exchange: LocalStorageTuple=%d NetworkStorageTuple=%d", state->LocalStorageTuple, state->NetworkStorageTuple);
+
+	/*
+	 * clean out the tuple table
+	 */
+	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	ExecClearTuple(node->ss.ss_ScanTupleSlot);
+
+	ExecEndNode(linitial(node->custom_ps));
 }
 
 static void
@@ -148,13 +289,20 @@ make_exchange(Plan *subplan, fr_options_t frOpts, bool drop_duplicates, int myno
 	node->custom_plans = list_make1(subplan);
 
 	/* Build an appropriate target list using a cached Relation entry */
-	plan->targetlist = subplan->targetlist;
-//	RelationClose(parent_rel);
+	plan->targetlist = NULL;
+	node->custom_scan_tlist = NULL;
+
+	/* Init plan by GATHER analogy */
+//	plan->initPlan = subplan->initPlan;
+//	subplan->initPlan = NIL;
+	plan->qual = NIL;
+	plan->lefttree = subplan;
+	plan->righttree = NULL;
+	plan->parallel_aware = false;
+	plan->parallel_safe = false;
 
 	/* No physical relation will be scanned */
 	node->scan.scanrelid = 0;
-
-	node->custom_scan_tlist = NULL;
 
 	/* Pack private info */
 	Data = palloc(sizeof(ExchangePrivateData));
@@ -168,28 +316,6 @@ make_exchange(Plan *subplan, fr_options_t frOpts, bool drop_duplicates, int myno
 	return plan;
 }
 
-void
-EXCHANGE_Init(void)
-{
-	exchange_plan_methods.CustomName 			= "ExchangePlan";
-	exchange_plan_methods.CreateCustomScanState	= EXCHANGE_Create_state;
-
-	/* setup exec methods */
-	exchange_exec_methods.CustomName				= "Exchange";
-	exchange_exec_methods.BeginCustomScan			= EXCHANGE_Begin;
-	exchange_exec_methods.ExecCustomScan			= EXCHANGE_Execute;
-	exchange_exec_methods.EndCustomScan				= EXCHANGE_End;
-	exchange_exec_methods.ReScanCustomScan			= EXCHANGE_Rescan;
-	exchange_exec_methods.MarkPosCustomScan			= NULL;
-	exchange_exec_methods.RestrPosCustomScan		= NULL;
-	exchange_exec_methods.EstimateDSMCustomScan  	= NULL;
-	exchange_exec_methods.InitializeDSMCustomScan 	= NULL;
-	exchange_exec_methods.InitializeWorkerCustomScan= NULL;
-	exchange_exec_methods.ReInitializeDSMCustomScan = NULL;
-	exchange_exec_methods.ShutdownCustomScan		= NULL;
-	exchange_exec_methods.ExplainCustomScan			= EXCHANGE_Explain;
-}
-
 static int
 fragmentation_fn_default(int value, int mynum, int nnodes)
 {
@@ -201,7 +327,9 @@ static int
 fragmentation_fn_gather(int value, int nodenum, int nnodes)
 {
 	Assert((nodenum >= 0) && (nodenum < nnodes));
-	return nodenum;
+	Assert(CoordinatorNode >= 0);
+
+	return CoordinatorNode;
 }
 
 static int
@@ -210,7 +338,7 @@ fragmentation_fn_empty(int value, int nnodes, int mynum)
 	return mynum;
 }
 
-static fragmentation_fn_t
+fragmentation_fn_t
 frFuncs(fr_func_id fid)
 {
 	switch (fid)
@@ -220,8 +348,10 @@ frFuncs(fr_func_id fid)
 	case FR_FUNC_GATHER:
 		return fragmentation_fn_gather;
 
-	default:
-		elog(LOG, "Undefined function");
+	case FR_FUNC_NINITIALIZED:
 		return fragmentation_fn_empty;
+	default:
+		elog(ERROR, "Undefined function");
 	}
+	return NULL;
 }

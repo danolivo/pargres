@@ -7,6 +7,8 @@
 #include "postgres.h"
 
 #include "common.h"
+#include "connection.h"
+#include "exchange.h"
 #include "hooks_exec.h"
 
 static ExecutorStart_hook_type	prev_ExecutorStart = NULL;
@@ -32,15 +34,27 @@ HOOK_ExecStart_injection(QueryDesc *queryDesc, int eflags)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
-
-	elog(LOG, "HOOK_ExecStart_injection: %d", list_length(ExchangeNodesPrivate));
+//	elog(LOG, "HOOK_ExecStart_injection: %d", list_length(ExchangeNodesPrivate));
 }
 
 static void
 HOOK_ExecEnd_injection(QueryDesc *queryDesc)
 {
+	/* Execute before hook because it destruct memory context of exchange list */
+	if (PargresInitialized)
+	{
+//		elog(LOG, "HOOK_ExecEnd_injection 1");
+		if (CoordinatorNode == node_number)
+			CONN_Check_query_result();
+
+		list_free(ExchangeNodesPrivate);
+		ExchangeNodesPrivate = NIL;
+	}
+
 	if (prev_ExecutorEnd)
 		prev_ExecutorEnd(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
+//	if (PargresInitialized)
+//		elog(LOG, "HOOK_ExecEnd_injection 2");
 }

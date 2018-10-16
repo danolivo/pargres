@@ -24,11 +24,9 @@
 
 PG_MODULE_MAGIC;
 
-static int CoordinatorNode = -1;
-static int tag = -1;
-static bool PargresInitialized = false;
-
 PG_FUNCTION_INFO_V1(set_query_id);
+PG_FUNCTION_INFO_V1(set_exchange_ports);
+PG_FUNCTION_INFO_V1(isLocalValue);
 
 /*
  * Declarations
@@ -50,7 +48,6 @@ FragRels	frRelations[1000];
 
 /* Name of relation with fragmentation options */
 #define RELATIONS_FRAG_CONFIG		"relsfrag"
-//#define RELATIONS_PARGRES_CONFIG	"pargres_config"
 
 static ProcessUtility_hook_type 	next_ProcessUtility_hook = NULL;
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
@@ -65,6 +62,7 @@ static void changeModifyTablePlan(Plan *plan, PlannedStmt *stmt,
 								  fr_options_t outerFrOpts);
 static void create_table_frag(const char *relname, int attno, fr_func_id fid);
 static void load_description_frag(void);
+static fr_options_t getRelFrag(const char *relname);
 
 #define NODES_MAX_NUM	(1024)
 /*
@@ -102,7 +100,7 @@ set_sequence_options(CreateSeqStmt *seq, int nnum)
  * It hooks CREATE TABLE command and some other to manage database distribution.
  */
 static void
-ParGRES_Utility_hooking(PlannedStmt *pstmt,
+HOOK_Utility_injection(PlannedStmt *pstmt,
 						const char *queryString,
 						ProcessUtilityContext context,
 						ParamListInfo params,
@@ -120,9 +118,8 @@ ParGRES_Utility_hooking(PlannedStmt *pstmt,
 //		set_sequence_options((CreateSeqStmt *) parsetree, node_number);
 		break;
 	case T_CreateStmt: /* CREATE TABLE */
-		create_table_frag(((CreateStmt *)parsetree)->relation->relname,
-							1, FR_FUNC_DEFAULT);
-//		add_table_fragmentation((CreateStmt *) parsetree);
+		create_table_frag(((CreateStmt *)parsetree)->relation->relname, 1,
+						  FR_FUNC_DEFAULT);
 		break;
 	default:
 		break;
@@ -135,6 +132,7 @@ ParGRES_Utility_hooking(PlannedStmt *pstmt,
 		standard_ProcessUtility(pstmt, queryString,
 											context, params, queryEnv,
 											dest, completionTag);
+	CONN_Check_query_result();
 }
 
 static void
@@ -142,20 +140,6 @@ PLAN_Hooks_init(void)
 {
 	prev_planner_hook	= planner_hook;
 	planner_hook		= HOOK_Planner_injection;
-}
-
-/*
- * Calls standard query planner or its previous hook.
- */
-static PlannedStmt *
-call_default_planner(Query *parse,
-					 int cursorOptions,
-					 ParamListInfo boundParams)
-{
-	if (prev_planner_hook)
-		return prev_planner_hook(parse, cursorOptions, boundParams);
-	else
-		return standard_planner(parse, cursorOptions, boundParams);
 }
 
 static fr_options_t
@@ -190,6 +174,21 @@ get_fragmentation(Oid relid)
 	}
 	else
 		elog(LOG, "Relation relid=%d not exists!", relid);
+
+	return result;
+}
+
+static fr_options_t
+getRelFrag(const char *relname)
+{
+	fr_options_t	result = NO_FRAGMENTATION;
+	int i = 0;
+
+	while ((i < nfrRelations) && (strcmp(frRelations[i].relname, relname) != 0))
+			i++;
+
+	if (i < nfrRelations)
+		result = frRelations[i].frOpts;
 
 	return result;
 }
@@ -240,7 +239,6 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 		break;
 	case T_SeqScan:
 		relid = getrelid(((SeqScan *)root)->scanrelid, stmt->rtable);
-//		elog(LOG, "search relid=%d", relid);
 		FrOpts = get_fragmentation(relid);
 		return FrOpts;
 	default:
@@ -255,19 +253,6 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 		if (!isNullFragmentation(&outerFrOpts))
 			return outerFrOpts;
 		break;
-	}
-
-	/* Insert EXCHANGE into HEAD, after GATHER node */
-	if (root == stmt->planTree)
-	{
-		fr_options_t frOpts = {.attno = 1, .funcId = FR_FUNC_GATHER};
-
-//		Assert(nodeTag(root) == T_Gather);
-		elog(LOG, "Planner: CoordinatorNode: %d", CoordinatorNode);
-		Assert(CoordinatorNode >= 0);
-		Assert(innerPlan(root) == NULL);
-		stmt->planTree = make_exchange(stmt->planTree,
-				frOpts, false, CoordinatorNode, nodes_at_cluster);
 	}
 
 	return NO_FRAGMENTATION;
@@ -292,8 +277,12 @@ changeModifyTablePlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 	Assert(list_length(modify_table->plans) == 1);
 //elog(LOG, "changeModifyTablePlan: %d %d", node_number, nodes_at_cluster);
 	/* Insert EXCHANGE node as a children of INSERT node */
-	linitial(modify_table->plans) = make_exchange(linitial(modify_table->plans),
+	if (nodeTag(linitial(modify_table->plans)) == T_Result)
+		linitial(modify_table->plans) = make_exchange(linitial(modify_table->plans),
 			get_fragmentation(resultRelationOid), true, node_number, nodes_at_cluster);
+	else
+		linitial(modify_table->plans) = make_exchange(linitial(modify_table->plans),
+					get_fragmentation(resultRelationOid), false, node_number, nodes_at_cluster);
 }
 
 /*
@@ -305,7 +294,7 @@ HOOK_Parser_injection(ParseState *pstate, Query *query)
 	if (prev_post_parse_analyze_hook)
 		prev_post_parse_analyze_hook(pstate, query);
 
-	elog(LOG, "[%d]: source:%s", node_number, pstate->p_sourcetext);
+//	elog(LOG, "Parser Injection start");
 	if ((query->commandType == CMD_UTILITY) && (nodeTag(query->utilityStmt) == T_CopyStmt))
 		return;
 
@@ -316,6 +305,12 @@ HOOK_Parser_injection(ParseState *pstate, Query *query)
 	PargresInitialized = true;
 
 	if (strstr(pstate->p_sourcetext, "set_query_id(") != NULL)
+	{
+		PargresInitialized = false;
+		return;
+	}
+
+	if (strstr(pstate->p_sourcetext, "set_exchange_ports(") != NULL)
 	{
 		PargresInitialized = false;
 		return;
@@ -334,26 +329,30 @@ HOOK_Parser_injection(ParseState *pstate, Query *query)
 	 * We setup listener socket before connection. After Query sending backends
 	 * from other nodes will set connection to me.
 	 */
-	tag = CONN_Init_socket();
-	Assert(tag >=0);
+	CONN_Init_socket(0);
 
 	/* Init connection */
 	if (CONN_Set_all() < 0)
 		return;
 
 	/* Send CoordinatorId and query tag */
-	CONN_Init_execution(tag);
+	CONN_Init_execution();
 
 	CONN_Launch_query(pstate->p_sourcetext);
+//	elog(LOG, "Parser Injection Finish");
 }
 
 PlannedStmt *
 HOOK_Planner_injection(Query *parse, int cursorOptions, ParamListInfo boundParams)
 {
-	PlannedStmt *stmt;
-	Plan		*root;
+	PlannedStmt 	*stmt;
+	Plan			*root;
+	fr_options_t	frOpts = {.attno = 1, .funcId = FR_FUNC_GATHER};
 
-	stmt = call_default_planner(parse, cursorOptions, boundParams);
+	if (prev_planner_hook)
+		stmt = prev_planner_hook(parse, cursorOptions, boundParams);
+	else
+		stmt = standard_planner(parse, cursorOptions, boundParams);
 
 	if (!PargresInitialized)
 		return stmt;
@@ -365,6 +364,12 @@ HOOK_Planner_injection(Query *parse, int cursorOptions, ParamListInfo boundParam
 	 * Traverse a tree. We pass on a statement for mapping relation IDs.
 	 */
 	traverse_tree(root, stmt);
+
+//	elog(LOG, "Planner: CoordinatorNode: %d nodeTag=%d", CoordinatorNode, nodeTag(stmt->planTree));
+	Assert(CoordinatorNode >= 0);
+	Assert(innerPlan(stmt->planTree) == NULL);
+	stmt->planTree = make_exchange(stmt->planTree,
+				frOpts, false, node_number, nodes_at_cluster);
 
 	return stmt;
 }
@@ -403,12 +408,12 @@ _PG_init(void)
 
 	/* ProcessUtility hook */
 	next_ProcessUtility_hook = ProcessUtility_hook;
-	ProcessUtility_hook = ParGRES_Utility_hooking;
+	ProcessUtility_hook = HOOK_Utility_injection;
 
 	prev_post_parse_analyze_hook = post_parse_analyze_hook;
 	post_parse_analyze_hook = HOOK_Parser_injection;
 
-	EXCHANGE_Init();
+	EXCHANGE_Init_methods();
 
 	PLAN_Hooks_init();
 	EXEC_Hooks_init();
@@ -502,10 +507,44 @@ load_description_frag(void)
 Datum
 set_query_id(PG_FUNCTION_ARGS)
 {
+	int port;
 	CoordinatorNode = PG_GETARG_INT32(0);
-	tag = PG_GETARG_INT32(1);
-//	elog(LOG, "set_query_id: nodeID=%d tag=%d", CoordinatorNode, tag);
 
+//	port = PG_GETARG_INT32(1);
+//	elog(LOG, "set_query_id: nodeID=%d tag=%d", CoordinatorNode, tag);
+	port = CONN_Init_socket(0);
+	Assert(port >= 0);
+
+	PG_RETURN_INT32(port);
+}
+
+Datum set_exchange_ports(PG_FUNCTION_ARGS)
+{
+	/* Parse input string to exchange node ports */
+	char	*ports = TextDatumGetCString(PG_GETARG_DATUM(0));
+
+	CONN_Parse_ports(ports);
 	PG_RETURN_VOID();
 }
 
+Datum
+isLocalValue(PG_FUNCTION_ARGS)
+{
+	char			*relname = TextDatumGetCString(PG_GETARG_DATUM(0));
+	int				value = PG_GETARG_INT32(1);
+	bool			result;
+	fr_options_t	frOpts;
+	fragmentation_fn_t	func;
+
+	if (nfrRelations == 0)
+		load_description_frag();
+	if (nfrRelations == 0)
+		PG_RETURN_BOOL(true);
+
+	frOpts = getRelFrag(relname);
+	func = frFuncs(frOpts.funcId);
+
+	result = (func(value, node_number, nodes_at_cluster) == node_number);
+
+	PG_RETURN_BOOL(result);
+}
