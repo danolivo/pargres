@@ -4,6 +4,7 @@
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
+#include "libpq-fe.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/planner.h"
@@ -57,6 +58,10 @@ static void HOOK_Parser_injection(ParseState *pstate, Query *query);
 static PlannedStmt *HOOK_Planner_injection(Query *parse, int cursorOptions,
 											ParamListInfo boundParams);
 
+static void changeAggPlan(Plan *plan, PlannedStmt *stmt, fr_options_t outerFrOpts);
+static void changeJoinPlan(Plan *plan, PlannedStmt *stmt,
+						   fr_options_t innerFrOpts,
+						   fr_options_t outerFrOpts);
 static void changeModifyTablePlan(Plan *plan, PlannedStmt *stmt,
 								  fr_options_t innerFrOpts,
 								  fr_options_t outerFrOpts);
@@ -94,46 +99,6 @@ set_sequence_options(CreateSeqStmt *seq, int nnum)
 						  makeDefElem("start", (Node *) makeFloat(psprintf(INT64_FORMAT, base)), -1));
 }
 */
-/*
- * ParGRES_Utility_hooking
- *
- * It hooks CREATE TABLE command and some other to manage database distribution.
- */
-static void
-HOOK_Utility_injection(PlannedStmt *pstmt,
-						const char *queryString,
-						ProcessUtilityContext context,
-						ParamListInfo params,
-						QueryEnvironment *queryEnv,
-						DestReceiver *dest,
-						char *completionTag)
-{
-	Node	*parsetree = pstmt->utilityStmt;
-
-	Assert(nfrRelations < 100);
-
-	switch (nodeTag(parsetree))
-	{
-	case T_CreateSeqStmt: /* CREATE SEQUENCE */
-//		set_sequence_options((CreateSeqStmt *) parsetree, node_number);
-		break;
-	case T_CreateStmt: /* CREATE TABLE */
-		create_table_frag(((CreateStmt *)parsetree)->relation->relname, 1,
-						  FR_FUNC_DEFAULT);
-		break;
-	default:
-		break;
-	}
-
-	if (next_ProcessUtility_hook)
-		(*next_ProcessUtility_hook) (pstmt, queryString, context, params, queryEnv,
-								 	 dest, completionTag);
-	else
-		standard_ProcessUtility(pstmt, queryString,
-											context, params, queryEnv,
-											dest, completionTag);
-	CONN_Check_query_result();
-}
 
 static void
 PLAN_Hooks_init(void)
@@ -203,7 +168,7 @@ isNullFragmentation(fr_options_t *frOpts)
 }
 
 static bool
-isEqualFragmentation(fr_options_t *frOpts1, fr_options_t *frOpts2)
+isEqualFragmentation(const fr_options_t *frOpts1, const fr_options_t *frOpts2)
 {
 	if (frOpts1->attno != frOpts2->attno)
 		return false;
@@ -237,10 +202,21 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 	case T_ModifyTable:
 		changeModifyTablePlan(root, stmt, innerFrOpts, outerFrOpts);
 		break;
+
 	case T_SeqScan:
 		relid = getrelid(((SeqScan *)root)->scanrelid, stmt->rtable);
 		FrOpts = get_fragmentation(relid);
 		return FrOpts;
+
+	case T_Agg:
+		Assert(root->righttree == NULL);
+		changeAggPlan(root, stmt, outerFrOpts);
+		break;
+	case T_HashJoin:
+	case T_MergeJoin:
+	case T_NestLoop:
+		changeJoinPlan(root, stmt, innerFrOpts, outerFrOpts);
+		break;
 	default:
 		if (!isNullFragmentation(&innerFrOpts) && !isNullFragmentation(&outerFrOpts))
 		{
@@ -259,12 +235,43 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 }
 
 static void
+changeAggPlan(Plan *plan, PlannedStmt *stmt, fr_options_t outerFrOpts)
+{
+	Agg	*agg = (Agg *) plan;
+
+	/*
+	 * In the case of simple and final aggregation we have same logic:
+	 * insert exchange node below T_Agg node.
+	 * Exchange below need to send each tuple to each over node, 'broadcast tuple'.
+	 */
+	if (!DO_AGGSPLIT_SKIPFINAL(agg->aggsplit))
+	{
+		Assert(plan->righttree == NULL);
+		plan->lefttree = make_exchange(plan->lefttree, outerFrOpts, false, true, node_number, nodes_at_cluster);
+	}
+}
+
+static void
+changeJoinPlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
+			   fr_options_t outerFrOpts)
+{
+	if (isEqualFragmentation(&innerFrOpts, &NO_FRAGMENTATION) || isEqualFragmentation(&outerFrOpts, &NO_FRAGMENTATION))
+		return;
+
+	if (isEqualFragmentation(&innerFrOpts, &outerFrOpts))
+		return;
+
+	plan->righttree = make_exchange(plan->righttree, outerFrOpts, false, false, node_number, nodes_at_cluster);
+}
+
+static void
 changeModifyTablePlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 													fr_options_t outerFrOpts)
 {
 	ModifyTable	*modify_table = (ModifyTable *) plan;
 	List		*rangeTable = stmt->rtable;
 	Oid			resultRelationOid;
+	int			nodetag = nodeTag(linitial(modify_table->plans));
 
 	/* Skip if not ModifyTable with 'INSERT' command */
 	if (!IsA(modify_table, ModifyTable) || modify_table->operation != CMD_INSERT)
@@ -275,14 +282,92 @@ changeModifyTablePlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 	resultRelationOid = getrelid(linitial_int(stmt->resultRelations),
 																	rangeTable);
 	Assert(list_length(modify_table->plans) == 1);
-//elog(LOG, "changeModifyTablePlan: %d %d", node_number, nodes_at_cluster);
+
 	/* Insert EXCHANGE node as a children of INSERT node */
-	if (nodeTag(linitial(modify_table->plans)) == T_Result)
+	if ((nodetag == T_Result) || (nodetag == T_ValuesScan))
 		linitial(modify_table->plans) = make_exchange(linitial(modify_table->plans),
-			get_fragmentation(resultRelationOid), true, node_number, nodes_at_cluster);
+			get_fragmentation(resultRelationOid), true, false, node_number, nodes_at_cluster);
+	else {
+//		elog(LOG, "Seq Scan INSERT subplan");
+		linitial(modify_table->plans) = make_exchange(linitial(modify_table->plans),
+					get_fragmentation(resultRelationOid), false, false, node_number, nodes_at_cluster);
+	}
+}
+
+static void
+Do_Refragment_relation(const char *relname)
+{
+	PGconn		*conn;
+	PGresult	*result;
+	char		conninfo[STRING_SIZE_MAX];
+	char		command[STRING_SIZE_MAX];
+
+	sprintf(conninfo, "host=%s port=%d%c", "localhost", 5433, '\0');
+	conn = PQconnectdb(conninfo);
+	Assert(PQstatus(conn) != CONNECTION_BAD);
+
+	sprintf(command,
+	"INSERT INTO pgbench_accounts (SELECT * FROM %s) ON CONFLICT DO NOTHING;%c",
+																relname, '\0');
+	result = PQexec(conn, command);
+	Assert(PQresultStatus(result) != PGRES_FATAL_ERROR);
+
+	sprintf(command,
+	"DELETE FROM %s WHERE isLocalValue('%s', aid) = false;%c",
+														relname, relname, '\0');
+	result = PQexec(conn, command);
+	Assert(PQresultStatus(result) != PGRES_FATAL_ERROR);
+}
+
+/*
+ * HOOK_Utility_injection
+ *
+ * It hooks CREATE TABLE command and some other to manage database distribution.
+ */
+static void
+HOOK_Utility_injection(PlannedStmt *pstmt,
+						const char *queryString,
+						ProcessUtilityContext context,
+						ParamListInfo params,
+						QueryEnvironment *queryEnv,
+						DestReceiver *dest,
+						char *completionTag)
+{
+	Node	*parsetree = pstmt->utilityStmt;
+
+	Assert(nfrRelations < 100);
+
+	switch (nodeTag(parsetree))
+	{
+	case T_CreateSeqStmt: /* CREATE SEQUENCE */
+//		set_sequence_options((CreateSeqStmt *) parsetree, node_number);
+		break;
+	case T_CreateStmt: /* CREATE TABLE */
+		create_table_frag(((CreateStmt *)parsetree)->relation->relname, 1,
+						  FR_FUNC_DEFAULT);
+		break;
+	default:
+		break;
+	}
+
+	if (next_ProcessUtility_hook)
+		(*next_ProcessUtility_hook) (pstmt, queryString, context, params, queryEnv,
+								 	 dest, completionTag);
 	else
-		linitial(modify_table->plans) = make_exchange(linitial(modify_table->plans),
-					get_fragmentation(resultRelationOid), false, node_number, nodes_at_cluster);
+		standard_ProcessUtility(pstmt, queryString,
+											context, params, queryEnv,
+											dest, completionTag);
+	CONN_Check_query_result();
+
+	if ((nodeTag(parsetree) == T_CopyStmt) && (CoordinatorNode == node_number))
+	{
+		CopyStmt *cpy = (CopyStmt *) parsetree;
+//		elog(LOG, "Post COPY opts: from=%u relname=%s", cpy->is_from, cpy->relation->relname);
+		if ((cpy->is_from) && (cpy->relation))
+		{
+//			Do_Refragment_relation(cpy->relation->relname);
+		}
+	}
 }
 
 /*
@@ -365,12 +450,18 @@ HOOK_Planner_injection(Query *parse, int cursorOptions, ParamListInfo boundParam
 	 */
 	traverse_tree(root, stmt);
 
-//	elog(LOG, "Planner: CoordinatorNode: %d nodeTag=%d", CoordinatorNode, nodeTag(stmt->planTree));
-	Assert(CoordinatorNode >= 0);
-	Assert(innerPlan(stmt->planTree) == NULL);
-	stmt->planTree = make_exchange(stmt->planTree,
-				frOpts, false, node_number, nodes_at_cluster);
-
+	if (nodeTag(stmt->planTree) != T_Agg)
+	{
+		/*
+		 * Aggregate node generate same value at each parallel plan by
+		 * a exchange broadcasting in lefttree node. Now, We do not need to shuffle
+		 * the data.
+		 */
+		Assert(CoordinatorNode >= 0);
+		Assert(innerPlan(stmt->planTree) == NULL);
+		stmt->planTree = make_exchange(stmt->planTree,
+				frOpts, false, false, node_number, nodes_at_cluster);
+	}
 	return stmt;
 }
 
@@ -510,8 +601,6 @@ set_query_id(PG_FUNCTION_ARGS)
 	int port;
 	CoordinatorNode = PG_GETARG_INT32(0);
 
-//	port = PG_GETARG_INT32(1);
-//	elog(LOG, "set_query_id: nodeID=%d tag=%d", CoordinatorNode, tag);
 	port = CONN_Init_socket(0);
 	Assert(port >= 0);
 
@@ -535,7 +624,7 @@ isLocalValue(PG_FUNCTION_ARGS)
 	bool			result;
 	fr_options_t	frOpts;
 	fragmentation_fn_t	func;
-
+//elog(LOG, "isLocalValue: %s, %d", relname, value);
 	if (nfrRelations == 0)
 		load_description_frag();
 	if (nfrRelations == 0)

@@ -14,6 +14,7 @@ extern int node_number;
 extern int nodes_at_cluster;
 
 #define NODES_MAX_NUM	(1024)
+#define STRING_SIZE_MAX	(1024)
 
 extern void CONN_Init_module(void);
 extern int CONN_Init_socket(int port);

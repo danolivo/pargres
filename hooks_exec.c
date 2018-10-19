@@ -35,6 +35,17 @@ HOOK_ExecStart_injection(QueryDesc *queryDesc, int eflags)
 	else
 		standard_ExecutorStart(queryDesc, eflags);
 //	elog(LOG, "HOOK_ExecStart_injection: %d", list_length(ExchangeNodesPrivate));
+	if (PargresInitialized)
+	{
+		ExchangeState	*state;
+		int				exchNum;
+
+		for (exchNum = 0; exchNum < list_length(ExchangeNodesPrivate); exchNum++)
+		{
+			state = (ExchangeState *) list_nth(ExchangeNodesPrivate, exchNum);
+			CONN_Init_exchange(state->read_sock, state->write_sock);
+		}
+	}
 }
 
 static void
@@ -43,7 +54,7 @@ HOOK_ExecEnd_injection(QueryDesc *queryDesc)
 	/* Execute before hook because it destruct memory context of exchange list */
 	if (PargresInitialized)
 	{
-//		elog(LOG, "HOOK_ExecEnd_injection 1");
+//		elog(INFO, "HOOK_ExecEnd_injection 1");
 		if (CoordinatorNode == node_number)
 			CONN_Check_query_result();
 

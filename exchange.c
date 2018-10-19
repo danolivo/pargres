@@ -3,6 +3,7 @@
 #include "common.h"
 #include "connection.h"
 #include "exchange.h"
+#include "nodes/makefuncs.h"
 #include "pargres.h"
 
 static CustomScanMethods	exchange_plan_methods;
@@ -24,6 +25,7 @@ EXCHANGE_Init_methods(void)
 {
 	exchange_plan_methods.CustomName 			= "ExchangePlan";
 	exchange_plan_methods.CreateCustomScanState	= EXCHANGE_Create_state;
+	RegisterCustomScanMethods(&exchange_plan_methods);
 
 	/* setup exec methods */
 	exchange_exec_methods.CustomName				= "Exchange";
@@ -44,33 +46,46 @@ EXCHANGE_Init_methods(void)
 static Node *
 EXCHANGE_Create_state(CustomScan *node)
 {
-	ExchangePrivateData	*Data;
 	ExchangeState *state;
+	ListCell   *lc;
+	Var		   *var;
+	List	   *tlist = NIL;
 
-//	node->custom_scan_tlist = node->scan.plan.targetlist;
 	state = (ExchangeState *) palloc0(sizeof(ExchangeState));
 	NodeSetTag(state, T_CustomScanState);
-	Data = (ExchangePrivateData *) list_nth(node->custom_private, 0);
+
+	tlist = node->scan.plan.targetlist;
+	foreach(lc, node->scan.plan.lefttree->targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		var = makeVarFromTargetEntry(OUTER_VAR, tle);
+						tlist = lappend(tlist,
+										makeTargetEntry((Expr *) var,
+														tle->resno,
+														NULL,
+														tle->resjunk));
+	}
+	node->scan.plan.targetlist = tlist;
 
 	state->css.flags = node->flags;
 	state->css.methods = &exchange_exec_methods;
 
 	/* Extract necessary variables */
-	state->subplan = (Plan *) linitial(node->custom_plans);
-	state->frOpts = Data->frOpts;
-	state->drop_duplicates = Data->drop_duplicates;
-	state->mynode = Data->mynode;
-	state->nnodes = Data->nnodes;
+	state->frOpts.attno = intVal(list_nth(node->custom_private, 4));
+	state->frOpts.funcId = intVal(list_nth(node->custom_private, 5));
+	state->broadcast_mode = intVal(list_nth(node->custom_private, 2));
+	state->drop_duplicates = intVal(list_nth(node->custom_private, 3));
+	state->mynode = intVal(list_nth(node->custom_private, 1));
+	state->nnodes = intVal(list_nth(node->custom_private, 0));
 
 	state->read_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
 	state->write_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
-	CONN_Init_exchange(state->read_sock, state->write_sock);
 
 	/* Add Pointer to private EXCHANGE data to the list */
 	ExchangeNodesPrivate = lappend(ExchangeNodesPrivate, (Node *)state);
 
 	/* There should be exactly one subplan */
-	Assert(list_length(node->custom_plans) == 1);
+//	Assert(list_length(node->custom_plans) == 1);
 	Assert(!node->scan.plan.qual);
 
 	return (Node *) state;
@@ -80,41 +95,25 @@ static void
 EXCHANGE_Begin(CustomScanState *node, EState *estate, int eflags)
 {
 	ExchangeState	*state = (ExchangeState *) node;
-	PlanState		*child_ps;
 	TupleDesc		tupDesc;
 
-	/* It's convenient to store PlanState in 'custom_ps' */
-	node->custom_ps = list_make1(ExecInitNode(state->subplan, estate, eflags));
-	child_ps = (PlanState *) linitial(node->custom_ps);
-	node->ss.ps.plan->targetlist = child_ps->plan->targetlist;
-	outerPlanState(node) = child_ps;
-	tupDesc = ExecGetResultType(outerPlanState(node));
+	outerPlanState(node) = ExecInitNode(outerPlan(node->ss.ps.plan), estate, eflags);
+//elog(LOG, "EXCHANGE Begin!");
+//	node->ss.ps.plan->targetlist = outerPlanState(node)->plan->targetlist;
+
 	Assert(innerPlan(node->ss.ps.plan) == NULL);
-//	if (!node->ss.ps.plan->targetlist)
-//	{
-//		node->ss.ps.ps_ResultTupleSlot = ExecInitExtraTupleSlot(estate, tupDesc);
-//	elog(LOG, "EXCH before natts= %d %d", node->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor->natts, node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts);
-//	elog(LOG, "EXCH list_length=%d", list_length(node->ss.ps.plan->targetlist));
+
+	tupDesc = ExecGetResultType(outerPlanState(node));
 	node->ss.ss_ScanTupleSlot = ExecInitExtraTupleSlot(estate, tupDesc);
 	node->ss.ps.ps_ResultTupleSlot = ExecInitExtraTupleSlot(estate, tupDesc);
-//	ExecInitResultTupleSlotTL(estate, &node->ss.ps);
-//	ExecConditionalAssignProjectionInfo(&node->ss.ps, tupDesc, OUTER_VAR);
-//		elog(LOG, "Children natts=%d", child_ps->ps_ResultTupleSlot->tts_tupleDescriptor->natts);
-//	}
+//	ExecAssignProjectionInfo(&state->css.ss.ps, NULL);
 
-//
-//	ExecInitResultTupleSlotTL(child_ps->state, &node->ss.ps);
-//	ExecInitScanTupleSlot(child_ps->state, &node->ss, child_ps->ps_ResultTupleSlot->tts_tupleDescriptor);
-
-	//	node->ss.ps.ps_ResultTupleSlot = MakeTupleTableSlot(child_ps->ps_ResultTupleSlot->tts_tupleDescriptor);
-//	elog(LOG, "EXCH Begin: natts=%d %d", node->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor->natts, node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts);
 	state->NetworkIsActive = true;
 	state->LocalStorageIsActive = true;
 	state->NetworkStorageTuple = 0;
 	state->LocalStorageTuple = 0;
+//	elog(INFO, "EXCHA2-->");
 }
-
-//char tbuf[8192];
 
 static TupleTableSlot *
 GetTupleFromNetwork(ExchangeState *state, TupleTableSlot *slot, bool *NetworkIsActive)
@@ -126,7 +125,7 @@ GetTupleFromNetwork(ExchangeState *state, TupleTableSlot *slot, bool *NetworkIsA
 
 	if (res < 0)
 	{
-//		elog(LOG, "Network off");
+//		elog(LOG, "Network off. res=%d", res);
 		*NetworkIsActive = false;
 		return ExecClearTuple(slot);
 	}
@@ -145,16 +144,16 @@ GetTupleFromNetwork(ExchangeState *state, TupleTableSlot *slot, bool *NetworkIsA
 static TupleTableSlot *
 EXCHANGE_Execute(CustomScanState *node)
 {
-	PlanState		*child_ps = (PlanState *) linitial(node->custom_ps);
+	PlanState		*child_ps = outerPlanState(node);//(PlanState *) linitial(node->custom_ps);
 	TupleTableSlot	*slot = node->ss.ss_ScanTupleSlot;
 	bool			isnull;
 	Datum			value;
 	ExchangeState	*state = (ExchangeState *)node;
 	int				destnode;
-	ExprContext		*econtext;
-
-	econtext = state->css.ss.ps.ps_ExprContext;
-	ResetExprContext(econtext);
+//	ExprContext		*econtext;
+//	elog(LOG, "EXCHA-->3");
+//	econtext = state->css.ss.ps.ps_ExprContext;
+//	ResetExprContext(econtext);
 
 	for (;;)
 	{
@@ -190,22 +189,53 @@ EXCHANGE_Execute(CustomScanState *node)
 		{
 			if (!state->NetworkIsActive && !state->LocalStorageIsActive)
 			{
-				return NULL;
+				return slot;
 			}
 			else
 				continue;
 		}
 
-		/* Extract value of cell in a distribution domain */
-		value = slot_getattr(slot, state->frOpts.attno, &isnull);
-		Assert(!isnull);
+		if (slot->tts_nvalid > 0)
+			/*
+			 * If slot contains virtual tuple (after aggregate, for example),
+			 * we need to materialize it.
+			 */
+			ExecMaterializeSlot(slot);
 
-		frfunc = frFuncs(state->frOpts.funcId);
+		if (state->broadcast_mode)
+		{
+			int destnode;
+			int tupsize = offsetof(HeapTupleData, t_data);
 
-		val = DatumGetInt32(value);
+			for (destnode = 0; destnode < nodes_at_cluster; destnode++)
+			{
+				if (state->write_sock[destnode] == PGINVALID_SOCKET)
+					continue;
 
-		destnode = frfunc(val, state->mynode, state->nnodes);
-//		elog(LOG, "AFTER Analysis! destnode=%d state->mynode=%d", destnode, state->mynode);
+				CONN_Send(state->write_sock[destnode], slot->tts_tuple, tupsize);
+				CONN_Send(state->write_sock[destnode], slot->tts_tuple->t_data, slot->tts_tuple->t_len);
+			}
+
+			/* Send tuple to myself */
+			break;
+		}
+		else if (state->frOpts.funcId == FR_FUNC_GATHER)
+		{
+			destnode = CoordinatorNode;
+			elog(LOG, "FR_FUNC_GATHER");
+		}
+		else
+		{
+//			elog(INFO, "EXCHA-->7");
+			/* Extract value of cell in a distribution domain */
+			value = slot_getattr(slot, state->frOpts.attno, &isnull);
+			Assert(!isnull);
+//			elog(INFO, "EXCHA-->8");
+			frfunc = frFuncs(state->frOpts.funcId);
+			val = DatumGetInt32(value);
+			destnode = frfunc(val, state->mynode, state->nnodes);
+		}
+
 		if (destnode == state->mynode)
 			break;
 		else if (state->drop_duplicates)
@@ -216,6 +246,8 @@ EXCHANGE_Execute(CustomScanState *node)
 		else
 		{
 			int tupsize = offsetof(HeapTupleData, t_data);
+//			elog(LOG, "AGG result natts: %d tuple=%u", slot->tts_tupleDescriptor->natts, slot->tts_tuple == NULL);
+
 //			elog(LOG, "Send Tuple!: tupsize=%d len=%d Oid=%d", tupsize, slot->tts_tuple->t_len, slot->tts_tuple->t_tableOid);
 			CONN_Send(state->write_sock[destnode], slot->tts_tuple, tupsize);
 			CONN_Send(state->write_sock[destnode], slot->tts_tuple->t_data, slot->tts_tuple->t_len);
@@ -223,7 +255,7 @@ EXCHANGE_Execute(CustomScanState *node)
 			continue;
 		}
 	}
-
+//	elog(INFO, "EXCHA-->4");
 	return slot;
 }
 
@@ -232,7 +264,7 @@ EXCHANGE_End(CustomScanState *node)
 {
 //	ExchangeState	*state = (ExchangeState *)node;
 
-//	elog(LOG, "END Exchange: LocalStorageTuple=%d NetworkStorageTuple=%d", state->LocalStorageTuple, state->NetworkStorageTuple);
+//	elog(LOG, "END Exchange: LocalStorageTuple=%d NetworkStorageTuple=%d, CoordinatorNode=%d", state->LocalStorageTuple, state->NetworkStorageTuple, CoordinatorNode);
 
 	/*
 	 * clean out the tuple table
@@ -240,7 +272,7 @@ EXCHANGE_End(CustomScanState *node)
 	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
-	ExecEndNode(linitial(node->custom_ps));
+	ExecEndNode(outerPlanState(node));
 }
 
 static void
@@ -253,14 +285,23 @@ static void
 EXCHANGE_Explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	CustomScan			*cscan = (CustomScan *) node->ss.ps.plan;
-	ExchangePrivateData	*Data;
+	int					nnodes = intVal(list_nth(cscan->custom_private, 0));
+	int					mynode = intVal(list_nth(cscan->custom_private, 1));
+	bool				broadcast_mode = intVal(list_nth(cscan->custom_private, 2));
+	bool				drop_duplicates = intVal(list_nth(cscan->custom_private, 3));
+	fr_options_t		frOpts;
 	StringInfoData		str;
 
+	frOpts.attno = intVal(list_nth(cscan->custom_private, 4));
+	frOpts.funcId = intVal(list_nth(cscan->custom_private, 5));
 	initStringInfo(&str);
-	Data = (ExchangePrivateData *) list_nth(cscan->custom_private, 0);
-	appendStringInfo(&str, "attno: %d, funcId: %d, DD: %u", Data->frOpts.attno,
-													Data->frOpts.funcId,
-													Data->drop_duplicates);
+//	nnodes = list_nth(cscan->custom_private, 0);
+	appendStringInfo(&str, "attno: %d, funcId: %d, mynode=%d, nnodes=%d, Drop duplicates: %u, bcast: %u",
+					 frOpts.attno,
+					 frOpts.funcId,
+					 mynode,
+					 nnodes,
+					 drop_duplicates, broadcast_mode);
 
 	ExplainPropertyText("Exchange node", str.data, es);
 }
@@ -272,46 +313,46 @@ EXCHANGE_Explain(CustomScanState *node, List *ancestors, ExplainState *es)
  */
 
 Plan *
-make_exchange(Plan *subplan, fr_options_t frOpts, bool drop_duplicates, int mynode, int nnodes)
+make_exchange(Plan *subplan, fr_options_t frOpts,
+							bool drop_duplicates,
+							bool broadcast_mode,
+							int mynode, int nnodes)
 {
 	CustomScan			*node = makeNode(CustomScan);
 	Plan				*plan = &node->scan.plan;
-	ExchangePrivateData	*Data;
+
+	/* Init plan by GATHER analogy */
+	plan->initPlan = subplan->initPlan;
+	subplan->initPlan = NIL;
 
 	/* Copy costs etc */
 	plan->startup_cost = subplan->startup_cost;
 	plan->total_cost = subplan->total_cost;
 	plan->plan_rows = subplan->plan_rows;
 	plan->plan_width = subplan->plan_width;
-
-	/* Setup methods and child plan */
-	node->methods = &exchange_plan_methods;
-	node->custom_plans = list_make1(subplan);
-
-	/* Build an appropriate target list using a cached Relation entry */
-	plan->targetlist = NULL;
-	node->custom_scan_tlist = NULL;
-
-	/* Init plan by GATHER analogy */
-//	plan->initPlan = subplan->initPlan;
-//	subplan->initPlan = NIL;
 	plan->qual = NIL;
 	plan->lefttree = subplan;
 	plan->righttree = NULL;
 	plan->parallel_aware = false;
 	plan->parallel_safe = false;
+	plan->targetlist = NULL;
 
-	/* No physical relation will be scanned */
+	/* Setup methods and child plan */
+	node->methods = &exchange_plan_methods;
+//	node->custom_plans = list_make1(subplan);
+	node->custom_scan_tlist = NIL;
 	node->scan.scanrelid = 0;
+	node->custom_plans = NIL;
+	node->custom_exprs = NIL;
+	node->custom_private = NIL;
 
 	/* Pack private info */
-	Data = palloc(sizeof(ExchangePrivateData));
-	Data->frOpts = frOpts;
-	Data->drop_duplicates = drop_duplicates;
-	Data->mynode = mynode;
-	Data->nnodes = nnodes;
-//	elog(LOG, "make_exchange: %d %d", mynode, nnodes);
-	node->custom_private = lappend(NIL, Data);
+	node->custom_private = lappend(node->custom_private, makeInteger(nnodes));
+	node->custom_private = lappend(node->custom_private, makeInteger(mynode));
+	node->custom_private = lappend(node->custom_private, makeInteger(broadcast_mode));
+	node->custom_private = lappend(node->custom_private, makeInteger(drop_duplicates));
+	node->custom_private = lappend(node->custom_private, makeInteger(frOpts.attno));
+	node->custom_private = lappend(node->custom_private, makeInteger(frOpts.funcId));
 
 	return plan;
 }

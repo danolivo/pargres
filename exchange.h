@@ -29,18 +29,11 @@ typedef struct
 
 typedef struct
 {
-	fr_options_t	frOpts;
-	bool			drop_duplicates;
-	int				mynode;
-	int				nnodes;
-} ExchangePrivateData;
-
-typedef struct
-{
 	CustomScanState	css;
-	Plan			*subplan;
+//	Plan			*subplan;
 	fr_options_t	frOpts;
 	bool			drop_duplicates;
+	bool			broadcast_mode;
 	int				mynode;
 	int				nnodes;
 	pgsocket		*read_sock; /* incoming messages */
@@ -53,7 +46,10 @@ typedef struct
 } ExchangeState;
 
 extern void EXCHANGE_Init_methods(void);
-extern Plan *make_exchange(Plan *subplan, fr_options_t frOpts, bool drop_duplicates, int mynode, int nnodes);
+extern Plan *make_exchange(Plan *subplan, fr_options_t frOpts,
+							bool drop_duplicates,
+							bool broadcast_mode,
+							int mynode, int nnodes);
 extern fragmentation_fn_t frFuncs(fr_func_id fid);
 
 #endif /* EXCHANGE_H_ */

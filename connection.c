@@ -1,7 +1,6 @@
 /*
  * connection.c
  *
- *  Created on: 8 окт. 2018 г.
  *      Author: andrey
  */
 
@@ -29,10 +28,15 @@ int node_number;
 int nodes_at_cluster;
 
 static int ExchangePort[NODES_MAX_NUM];
-#define STRING_SIZE_MAX	(1024)
 static ppgconn *conn = NULL;
 
 NON_EXEC_STATIC pgsocket ExchangeSock = PGINVALID_SOCKET;
+
+static int _select(int nfds, fd_set *readfds, fd_set *writefds,
+				   struct timeval *timeout);
+static int _send(int socket, void *buffer, size_t size, int flags);
+static int _recv(int socket, void *buffer, size_t size, int flags);
+
 
 void
 CONN_Init_module(void)
@@ -49,7 +53,7 @@ int
 CONN_Init_socket(int port)
 {
 	struct sockaddr_in	addr;
-	socklen_t					addrlen = sizeof(addr);
+	socklen_t			addrlen = sizeof(addr);
 
 	addr.sin_family = AF_INET;
 	addr.sin_port = (in_port_t) port;
@@ -75,9 +79,7 @@ CONN_Init_socket(int port)
 
 	getsockname(ExchangeSock, (struct sockaddr *)&addr, &addrlen);
 	ExchangePort[node_number] = htons(addr.sin_port);
-//	elog(LOG, "My addr: %d %lu", ExchangePort[node_number], htonl(addr.sin_addr.s_addr));
 	Assert(ExchangePort[node_number] >= 0);
-//	elog(LOG, "Init listen: %d, node=%d", ExchangePort[node_number], node_number);
 
 	if (!pg_set_noblock(ExchangeSock))
 		elog(ERROR, "Nonblocking socket failed. ");
@@ -201,6 +203,8 @@ CONN_Check_query_result(void)
 	if (!conn)
 		return;
 
+//	elog(INFO, "Remote nodes result:");
+
 	do
 	{
 		for (node = 0; node < nodes_at_cluster; node++)
@@ -209,7 +213,10 @@ CONN_Check_query_result(void)
 				continue;
 
 			if ((result = PQgetResult(conn[node])) != NULL)
+			{
+//				elog(INFO, "[%d] status: %s", node, PQcmdStatus(result));
 				break;
+			}
 		}
 	} while (result);
 }
@@ -222,7 +229,7 @@ sendall(int s, char *buf, int len, int flags)
 
     while(total < len)
     {
-        n = send(s, buf+total, len-total, flags);
+        n = _send(s, buf+total, len-total, flags);
         if(n == -1) { break; }
         total += n;
     }
@@ -270,7 +277,7 @@ CONN_Init_exchange(pgsocket *read_sock, pgsocket *write_sock)
 		FD_ZERO(&readset);
 		FD_SET(ExchangeSock, &readset);
 
-		if(select(ExchangeSock+1, &readset, NULL, NULL, NULL) <= 0)
+		if(_select(ExchangeSock+1, &readset, NULL, NULL) <= 0)
 			perror("select");
 
 		Assert(FD_ISSET(ExchangeSock, &readset));
@@ -289,9 +296,6 @@ CONN_Init_exchange(pgsocket *read_sock, pgsocket *write_sock)
 			elog(ERROR, "Nonblocking socket failed. ");
 	}
 
-
-
-
 	for (node = 0; node < nodes_at_cluster; node++)
 	{
 		int buf = node_number;
@@ -305,7 +309,6 @@ CONN_Init_exchange(pgsocket *read_sock, pgsocket *write_sock)
 	while (messages > 0)
 	{
 		int high_sock = 0;
-		int conns;
 
 		FD_ZERO(&readset);
 		for (node = 0; node < nodes_at_cluster-1; node++)
@@ -315,7 +318,7 @@ CONN_Init_exchange(pgsocket *read_sock, pgsocket *write_sock)
 			if (high_sock < incoming_sock[node])
 				high_sock = incoming_sock[node];
 		}
-		if((conns = select(high_sock+1, &readset, NULL, NULL, NULL)) <= 0)
+		if(_select(high_sock+1, &readset, NULL, NULL) <= 0)
 			perror("select");
 
 		for (node = 0; node < nodes_at_cluster-1; node++)
@@ -325,7 +328,7 @@ CONN_Init_exchange(pgsocket *read_sock, pgsocket *write_sock)
 
 			if (FD_ISSET(incoming_sock[node], &readset))
 			{
-				bytes_read = recv(incoming_sock[node], &nodeID, sizeof(int), 0);
+				bytes_read = _recv(incoming_sock[node], &nodeID, sizeof(int), 0);
 				if (bytes_read != sizeof(int))
 					elog(LOG, "EE bytes_read=%d", bytes_read);
 				Assert(bytes_read == sizeof(int));
@@ -347,13 +350,17 @@ CONN_Exchange_close(pgsocket *write_sock)
 
 	for (node = 0; node < nodes_at_cluster; node++)
 	{
+		char close_sig = 'C';
+
 		if (write_sock[node] == PGINVALID_SOCKET)
 			continue;
+
+		CONN_Send(write_sock[node], &close_sig, 1);
 
 		closesocket(write_sock[node]);
 		write_sock[node] = PGINVALID_SOCKET;
 	}
-//	elog(LOG, "Close exchange connections");
+//	elog(LOG, "Close write_sock[] connections");
 }
 
 void
@@ -376,8 +383,55 @@ CONN_Parse_ports(char *ports)
 void
 CONN_Send(pgsocket sock, void *buf, int size)
 {
+//	fd_set writeset;
+	Assert(sock != PGINVALID_SOCKET);
 	if (sendall(sock, (char *)buf, size, 0) < 0)
 		perror("SEND Error");
+
+//	FD_ZERO(&writeset);
+//	FD_SET(sock, &writeset);
+//	if (_select(sock+1, NULL, &writeset, NULL) < 0)
+//		perror("AFTER SEND");
+}
+
+static int
+_select(int nfds, fd_set *readfds, fd_set *writefds,
+				   struct timeval *timeout)
+{
+	int res;
+
+	do
+	{
+		res = select(nfds, readfds, writefds, NULL, timeout);
+	} while (res < 0 && errno == EINTR);
+
+	return res;
+}
+
+static int
+_send(int socket, void *buffer, size_t size, int flags)
+{
+	int res;
+
+	do
+	{
+		res = send(socket, buffer, size, flags);
+	} while (res < 0 && errno == EINTR);
+
+	return res;
+}
+
+static int
+_recv(int socket, void *buffer, size_t size, int flags)
+{
+	int res;
+
+	do
+	{
+		res = recv(socket, buffer, size, flags);
+	} while (res < 0 && errno == EINTR);
+
+	return res;
 }
 
 HeapTuple
@@ -402,6 +456,8 @@ CONN_Recv(pgsocket *socks, int *res)
 	 * 2. high_sock == 0: all connections closed. Returns -1.
 	 * 3. No messages received. Returns 0.
 	 */
+	for (;;)
+	{
 		FD_ZERO(&readset);
 
 		for (i = 0; i < nodes_at_cluster; i++)
@@ -418,12 +474,19 @@ CONN_Recv(pgsocket *socks, int *res)
 		/* We have any open incoming connections? */
 		if (high_sock == 0)
 		{
-			*res = -1;
+			*res = -2;
 			return NULL;
 		}
-//elog(LOG, "HighSock=%d", high_sock);
-		if ((*res = select(high_sock+1, &readset, NULL, NULL, &timeout)) < 0)
-			perror("SELECT ERROR");
+
+		/* Check state of all incloming sockets without timeout */
+		*res = _select(high_sock+1, &readset, NULL, &timeout);
+
+		if (*res < 0)
+		{
+			perror("READ SELECT ERROR");
+		}
+		else if (*res == 0)
+			return NULL;
 
 		/* Search for socket triggered */
 		for (i = 0; i < nodes_at_cluster; i++)
@@ -433,35 +496,56 @@ CONN_Recv(pgsocket *socks, int *res)
 
 			if (FD_ISSET(socks[i], &readset))
 			{
-//				elog(LOG, "Before receive tuple");
-				if ((*res = recv(socks[i], &htHeader, offsetof(HeapTupleData, t_data), 0)) > 0)
+				if ((*res = _recv(socks[i], &htHeader, offsetof(HeapTupleData, t_data), 0)) > 1)
 				{
 					int res1;
-//					elog(LOG, "CONN_Recv HeapTuple received: size=%d t_len=%u Oid=%u", *res, htHeader.t_len, htHeader.t_tableOid);
+
+//					if ((*res == 1) && (*(char *)&htHeader == 'C'))
+//					{
+//						elog(LOG, "CONN_Recv: close connections");
+//						closesocket(socks[i]);
+//						socks[i] = PGINVALID_SOCKET;
+//						continue;
+//					}
+
 					FD_ZERO(&readset);
 					FD_SET(socks[i], &readset);
-					if ((res1 = select(socks[i]+1, &readset, NULL, NULL, NULL)) <= 0)
+
+					/* Wait for 'Body' of the tuple */
+					if ((res1 = _select(socks[i]+1, &readset, NULL, NULL)) <= 0)
 						Assert(0);
 
 					tuple = (HeapTuple) palloc0(HEAPTUPLESIZE + htHeader.t_len);
 					memcpy(tuple, &htHeader, HEAPTUPLESIZE);
 					tuple->t_data = (HeapTupleHeader) ((char *) tuple + HEAPTUPLESIZE);
-					res1 = recv(socks[i], tuple->t_data, tuple->t_len, 0);
+					res1 = _recv(socks[i], tuple->t_data, tuple->t_len, 0);
 					Assert(res1 == tuple->t_len);
 					*res += res1;
 					return tuple;
 				}
-				else if (*res < 0)
-					perror("RECEIVE ERROR");
-				else
+				else if (*res == 1)
 				{
-//					elog(LOG, "Close input socket: %d", socks[i]);
+//					elog(LOG, "CONN_Recv: close connection %d", i);
 					closesocket(socks[i]);
 					socks[i] = PGINVALID_SOCKET;
 					continue;
 				}
+				else if (*res < 0)
+				{
+					elog(LOG, "Receive problems at connection %d (sock %d)", i, socks[i]);
+					perror("RECEIVE ERROR");
+				}
+				else
+				{
+					Assert(0);
+//					elog(LOG, "Close input socket: %d", socks[i]);
+//					closesocket(socks[i]);
+//					socks[i] = PGINVALID_SOCKET;
+//					continue;
+				}
 			}
 		}
-		*res = 0;
-		return NULL;
+	}
+	Assert(0);
+	return NULL;
 }
