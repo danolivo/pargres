@@ -248,8 +248,10 @@ CONN_Init_exchange(pgsocket *read_sock, pgsocket *write_sock)
 	int					messages = nodes_at_cluster - 1;
 	pgsocket			*incoming_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
 
-	Assert(read_sock > 0);
+	Assert(read_sock != NULL);
+	Assert(write_sock != NULL);
 
+	elog(LOG, "Start CONN_Init_exchange");
 	/* Init sockets for connection for foreign servers */
 	for (node = 0; node < nodes_at_cluster; node++)
 	{
@@ -303,6 +305,7 @@ CONN_Init_exchange(pgsocket *read_sock, pgsocket *write_sock)
 		if (node == node_number)
 			continue;
 
+		Assert(write_sock[node] > 0);
 		sendall(write_sock[node], (char *)&buf, sizeof(int), 0);
 	}
 
@@ -340,6 +343,13 @@ CONN_Init_exchange(pgsocket *read_sock, pgsocket *write_sock)
 		}
 	}
 
+	for (node = 0; node < nodes_at_cluster-1; node++)
+		if (node != node_number)
+		{
+			Assert(read_sock[node] > 0);
+			Assert(write_sock[node] > 0);
+		}
+	elog(LOG, "Connections Established");
 	pfree(incoming_sock);
 }
 
@@ -355,6 +365,7 @@ CONN_Exchange_close(pgsocket *write_sock)
 		if (write_sock[node] == PGINVALID_SOCKET)
 			continue;
 
+		Assert(write_sock[node] > 0);
 		CONN_Send(write_sock[node], &close_sig, 1);
 
 		closesocket(write_sock[node]);
@@ -380,18 +391,19 @@ CONN_Parse_ports(char *ports)
 	Assert(node == nodes_at_cluster);
 }
 
-void
+int
 CONN_Send(pgsocket sock, void *buf, int size)
 {
 //	fd_set writeset;
 	Assert(sock != PGINVALID_SOCKET);
 	if (sendall(sock, (char *)buf, size, 0) < 0)
+	{
+		elog(LOG, "sock: %d", sock);
 		perror("SEND Error");
+		return -1;
+	}
 
-//	FD_ZERO(&writeset);
-//	FD_SET(sock, &writeset);
-//	if (_select(sock+1, NULL, &writeset, NULL) < 0)
-//		perror("AFTER SEND");
+	return 0;
 }
 
 static int
@@ -500,14 +512,6 @@ CONN_Recv(pgsocket *socks, int *res)
 				{
 					int res1;
 
-//					if ((*res == 1) && (*(char *)&htHeader == 'C'))
-//					{
-//						elog(LOG, "CONN_Recv: close connections");
-//						closesocket(socks[i]);
-//						socks[i] = PGINVALID_SOCKET;
-//						continue;
-//					}
-
 					FD_ZERO(&readset);
 					FD_SET(socks[i], &readset);
 
@@ -525,7 +529,7 @@ CONN_Recv(pgsocket *socks, int *res)
 				}
 				else if (*res == 1)
 				{
-//					elog(LOG, "CONN_Recv: close connection %d", i);
+					elog(LOG, "CONN_Recv: close connection %d", i);
 					closesocket(socks[i]);
 					socks[i] = PGINVALID_SOCKET;
 					continue;
@@ -536,13 +540,7 @@ CONN_Recv(pgsocket *socks, int *res)
 					perror("RECEIVE ERROR");
 				}
 				else
-				{
 					Assert(0);
-//					elog(LOG, "Close input socket: %d", socks[i]);
-//					closesocket(socks[i]);
-//					socks[i] = PGINVALID_SOCKET;
-//					continue;
-				}
 			}
 		}
 	}

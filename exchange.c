@@ -78,9 +78,6 @@ EXCHANGE_Create_state(CustomScan *node)
 	state->mynode = intVal(list_nth(node->custom_private, 1));
 	state->nnodes = intVal(list_nth(node->custom_private, 0));
 
-	state->read_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
-	state->write_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
-
 	/* Add Pointer to private EXCHANGE data to the list */
 	ExchangeNodesPrivate = lappend(ExchangeNodesPrivate, (Node *)state);
 
@@ -98,8 +95,6 @@ EXCHANGE_Begin(CustomScanState *node, EState *estate, int eflags)
 	TupleDesc		tupDesc;
 
 	outerPlanState(node) = ExecInitNode(outerPlan(node->ss.ps.plan), estate, eflags);
-//elog(LOG, "EXCHANGE Begin!");
-//	node->ss.ps.plan->targetlist = outerPlanState(node)->plan->targetlist;
 
 	Assert(innerPlan(node->ss.ps.plan) == NULL);
 
@@ -112,6 +107,13 @@ EXCHANGE_Begin(CustomScanState *node, EState *estate, int eflags)
 	state->LocalStorageIsActive = true;
 	state->NetworkStorageTuple = 0;
 	state->LocalStorageTuple = 0;
+
+	state->read_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
+	Assert(state->read_sock != NULL);
+	state->write_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
+	Assert(state->write_sock != NULL);
+	CONN_Init_exchange(state->read_sock, state->write_sock);
+
 //	elog(INFO, "EXCHA2-->");
 }
 
@@ -121,6 +123,7 @@ GetTupleFromNetwork(ExchangeState *state, TupleTableSlot *slot, bool *NetworkIsA
 	int res;
 	HeapTuple tuple;
 
+	Assert(state->read_sock > 0);
 	tuple = CONN_Recv(state->read_sock, &res);
 
 	if (res < 0)
@@ -144,16 +147,12 @@ GetTupleFromNetwork(ExchangeState *state, TupleTableSlot *slot, bool *NetworkIsA
 static TupleTableSlot *
 EXCHANGE_Execute(CustomScanState *node)
 {
-	PlanState		*child_ps = outerPlanState(node);//(PlanState *) linitial(node->custom_ps);
+	PlanState		*child_ps = outerPlanState(node);
 	TupleTableSlot	*slot = node->ss.ss_ScanTupleSlot;
 	bool			isnull;
 	Datum			value;
 	ExchangeState	*state = (ExchangeState *)node;
 	int				destnode;
-//	ExprContext		*econtext;
-//	elog(LOG, "EXCHA-->3");
-//	econtext = state->css.ss.ps.ps_ExprContext;
-//	ResetExprContext(econtext);
 
 	for (;;)
 	{
@@ -177,7 +176,7 @@ EXCHANGE_Execute(CustomScanState *node)
 
 			if (TupIsNull(slot))
 			{
-//				elog(LOG, "Close all outcoming connections. CoordinatorNode=%d", CoordinatorNode);
+				elog(LOG, "Close all outcoming connections. CoordinatorNode=%d", CoordinatorNode);
 				CONN_Exchange_close(state->write_sock);
 //				elog(LOG, "Close LocalStorageIsActive: state->NetworkIsActive=%u", state->NetworkIsActive);
 				state->LocalStorageIsActive = false;
@@ -222,17 +221,16 @@ EXCHANGE_Execute(CustomScanState *node)
 		else if (state->frOpts.funcId == FR_FUNC_GATHER)
 		{
 			destnode = CoordinatorNode;
-			elog(LOG, "FR_FUNC_GATHER");
 		}
 		else
 		{
-//			elog(INFO, "EXCHA-->7");
 			/* Extract value of cell in a distribution domain */
 			value = slot_getattr(slot, state->frOpts.attno, &isnull);
 			Assert(!isnull);
-//			elog(INFO, "EXCHA-->8");
+
 			frfunc = frFuncs(state->frOpts.funcId);
 			val = DatumGetInt32(value);
+//			elog(LOG, "mynode=%d value=%d", state->mynode, val);
 			destnode = frfunc(val, state->mynode, state->nnodes);
 		}
 
@@ -249,6 +247,7 @@ EXCHANGE_Execute(CustomScanState *node)
 //			elog(LOG, "AGG result natts: %d tuple=%u", slot->tts_tupleDescriptor->natts, slot->tts_tuple == NULL);
 
 //			elog(LOG, "Send Tuple!: tupsize=%d len=%d Oid=%d", tupsize, slot->tts_tuple->t_len, slot->tts_tuple->t_tableOid);
+			Assert(state->write_sock[destnode] > 0);
 			CONN_Send(state->write_sock[destnode], slot->tts_tuple, tupsize);
 			CONN_Send(state->write_sock[destnode], slot->tts_tuple->t_data, slot->tts_tuple->t_len);
 			/* ToDo: Send tuple to corresponding destnode exchange */

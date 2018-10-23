@@ -34,18 +34,24 @@ HOOK_ExecStart_injection(QueryDesc *queryDesc, int eflags)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
-//	elog(LOG, "HOOK_ExecStart_injection: %d", list_length(ExchangeNodesPrivate));
 	if (PargresInitialized)
-	{
-		ExchangeState	*state;
-		int				exchNum;
+		elog(LOG, "HOOK_ExecStart_injection: %d", list_length(ExchangeNodesPrivate));
+//	if (PargresInitialized)
+//	{
+//		ExchangeState	*state;
+//		int				exchNum;
 
-		for (exchNum = 0; exchNum < list_length(ExchangeNodesPrivate); exchNum++)
-		{
-			state = (ExchangeState *) list_nth(ExchangeNodesPrivate, exchNum);
-			CONN_Init_exchange(state->read_sock, state->write_sock);
-		}
-	}
+//		for (exchNum = 0; exchNum < list_length(ExchangeNodesPrivate); exchNum++)
+//		{
+//			state = (ExchangeState *) list_nth(ExchangeNodesPrivate, exchNum);
+
+//			state->read_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
+//			Assert(state->read_sock != NULL);
+//			state->write_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
+//			Assert(state->write_sock != NULL);
+//			CONN_Init_exchange(state->read_sock, state->write_sock);
+//		}
+//	}
 }
 
 static void
@@ -66,6 +72,6 @@ HOOK_ExecEnd_injection(QueryDesc *queryDesc)
 		prev_ExecutorEnd(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
-//	if (PargresInitialized)
-//		elog(LOG, "HOOK_ExecEnd_injection 2");
+	if (PargresInitialized)
+		elog(LOG, "HOOK_ExecEnd_injection 2");
 }

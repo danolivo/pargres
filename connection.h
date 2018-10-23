@@ -25,7 +25,7 @@ extern void CONN_Check_query_result(void);
 extern void CONN_Init_exchange(pgsocket *read_sock, pgsocket *write_sock);
 extern void CONN_Exchange_close(pgsocket *write_sock);
 extern void CONN_Parse_ports(char *ports);
-extern void CONN_Send(pgsocket sock, void *buf, int size);
+extern int CONN_Send(pgsocket sock, void *buf, int size);
 extern HeapTuple CONN_Recv(pgsocket *socks, int *res);
 
 #endif /* CONNECTION_H_ */

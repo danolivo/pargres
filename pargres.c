@@ -59,7 +59,7 @@ static PlannedStmt *HOOK_Planner_injection(Query *parse, int cursorOptions,
 											ParamListInfo boundParams);
 
 static void changeAggPlan(Plan *plan, PlannedStmt *stmt, fr_options_t outerFrOpts);
-static void changeJoinPlan(Plan *plan, PlannedStmt *stmt,
+static fr_options_t changeJoinPlan(Plan *plan, PlannedStmt *stmt,
 						   fr_options_t innerFrOpts,
 						   fr_options_t outerFrOpts);
 static void changeModifyTablePlan(Plan *plan, PlannedStmt *stmt,
@@ -177,6 +177,122 @@ isEqualFragmentation(const fr_options_t *frOpts1, const fr_options_t *frOpts2)
 	return true;
 }
 
+static int inner_frag_attr;
+static int outer_frag_attr;
+
+static void
+traverse_qual_list(Expr *node, int inner_attno, int outer_attno, int rec)
+{
+//	elog(INFO, "[%d] type=%d", rec, node->type);
+
+	switch (nodeTag(node))
+	{
+		case T_Var:
+		{
+			Var *variable = (Var *) node;
+
+			if (variable->varattno <= 0)
+			{
+				/* Do not process whole-row or system columns var */
+				elog(ERROR, "Qual list: Not used varattno: %d", variable->varattno);
+				break;
+			}
+			else if (variable->varno == INNER_VAR)
+			{
+				if (variable->varattno != inner_attno)
+				{
+//					elog(INFO, "variable->varattno = %d", variable->varattno);
+					inner_frag_attr = (inner_frag_attr == 0) ?
+										variable->varattno : -1;
+				}
+			}
+			else if (variable->varno == OUTER_VAR)
+			{
+				if (variable->varattno != outer_attno)
+				{
+	//				elog(INFO, "variable->varattno = %d", variable->varattno);
+					outer_frag_attr = (outer_frag_attr == 0) ?
+										variable->varattno : -1;
+				}
+			}
+			break;
+		}
+
+		case T_RelabelType:
+			traverse_qual_list(((RelabelType *) node)->arg,
+								inner_attno, outer_attno, rec+1);
+			break;
+		case T_FieldStore:
+			traverse_qual_list(((FieldStore *) node)->arg,
+								inner_attno, outer_attno, rec+1);
+			break;
+		case T_CoerceViaIO:
+			traverse_qual_list(((CoerceViaIO *) node)->arg,
+											inner_attno, outer_attno, rec+1);
+			break;
+		case T_ArrayCoerceExpr:
+			traverse_qual_list(((ArrayCoerceExpr *) node)->arg,
+											inner_attno, outer_attno, rec+1);
+			break;
+
+
+		case T_BoolExpr:
+		{
+			BoolExpr   *boolexpr = (BoolExpr *) node;
+			ListCell   *lc;
+
+			foreach(lc, boolexpr->args)
+			{
+				Expr *arg = (Expr *) lfirst(lc);
+				traverse_qual_list(arg, inner_attno, outer_attno, rec+1);
+			}
+			break;
+		}
+		case T_MinMaxExpr:
+		{
+			MinMaxExpr *minmaxexpr = (MinMaxExpr *) node;
+			ListCell   *lc;
+
+			foreach(lc, minmaxexpr->args)
+			{
+				Expr *arg = (Expr *) lfirst(lc);
+				traverse_qual_list(arg, inner_attno, outer_attno, rec+1);
+			}
+			break;
+		}
+		case T_OpExpr:
+		{
+			OpExpr	   *op = (OpExpr *) node;
+			ListCell   *lc;
+
+			foreach(lc, op->args)
+			{
+				Expr *arg = (Expr *) lfirst(lc);
+				traverse_qual_list(arg, inner_attno, outer_attno, rec+1);
+			}
+			break;
+
+		}
+
+
+		case T_Const:
+		default:
+			break;
+	}
+}
+
+static void
+vars(List *qual)
+{
+	ListCell   *lc;
+
+	foreach(lc, qual)
+	{
+		Expr *node = (Expr *) lfirst(lc);
+
+		traverse_qual_list(node, 1, 1, 0);
+	}
+}
 /*
  * Traverse the tree, analyze fragmentation and insert EXCHANGE nodes
  * to redistribute tuples for correct execution.
@@ -215,8 +331,21 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 	case T_HashJoin:
 	case T_MergeJoin:
 	case T_NestLoop:
+	{
+		inner_frag_attr = 0;
+		outer_frag_attr = 0;
+
+		if (nodeTag(root) == T_HashJoin)
+			vars(((HashJoin *) root)->hashclauses);
+		else if (nodeTag(root) == T_MergeJoin)
+					vars(((MergeJoin *) root)->mergeclauses);
+		else
+			vars(((Join *) root)->joinqual);
+//		elog(INFO, "frag_attr: %u %u", inner_frag_attr, outer_frag_attr);
+
 		changeJoinPlan(root, stmt, innerFrOpts, outerFrOpts);
 		break;
+	}
 	default:
 		if (!isNullFragmentation(&innerFrOpts) && !isNullFragmentation(&outerFrOpts))
 		{
@@ -251,17 +380,83 @@ changeAggPlan(Plan *plan, PlannedStmt *stmt, fr_options_t outerFrOpts)
 	}
 }
 
-static void
+static fr_options_t
 changeJoinPlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 			   fr_options_t outerFrOpts)
 {
+	Plan	**InnerPlan;
+
 	if (isEqualFragmentation(&innerFrOpts, &NO_FRAGMENTATION) || isEqualFragmentation(&outerFrOpts, &NO_FRAGMENTATION))
-		return;
+		/* Join with system relation. Made it locally */
+		return NO_FRAGMENTATION;
 
-	if (isEqualFragmentation(&innerFrOpts, &outerFrOpts))
-		return;
+	if (nodeTag(plan) == T_HashJoin)
+	{
+		Assert(nodeTag(innerPlan(plan)) == T_Hash);
+		InnerPlan = &outerPlan(innerPlan(plan));
+	}
+	else
+	{
+		InnerPlan = &innerPlan(plan);
+//		elog(INFO, "-------------------ERROR!------------");
+	}
 
-	plan->righttree = make_exchange(plan->righttree, outerFrOpts, false, false, node_number, nodes_at_cluster);
+	if ((inner_frag_attr < 0) || (outer_frag_attr < 0))
+	{
+		/* Join by more than one attribute. Broadcast inner table to all nodes */
+		*InnerPlan = make_exchange(*InnerPlan, outerFrOpts, false,
+										true, node_number, nodes_at_cluster);
+		return outerFrOpts;
+	}
+
+	if (outerFrOpts.attno != outer_frag_attr)
+	{
+		if (innerFrOpts.attno == inner_frag_attr)
+		{
+			outerFrOpts.attno = outer_frag_attr;
+			outerFrOpts.funcId = innerFrOpts.funcId;
+			outerPlan(plan) = make_exchange(outerPlan(plan), outerFrOpts, false,
+											false, node_number, nodes_at_cluster);
+			return outerFrOpts;
+		}
+		else
+		{
+			outerFrOpts.attno = outer_frag_attr;
+			innerFrOpts.attno = inner_frag_attr;
+			innerFrOpts.funcId = outerFrOpts.funcId;
+	//		elog(INFO, "-------------------INSERT!------------ %d %d %d %d", nodeTag(*InnerPlan), nodeTag(plan), nodeTag(outerPlan(plan)), nodeTag(innerPlan(plan)));
+			outerPlan(plan) = make_exchange(outerPlan(plan), outerFrOpts, false,
+											false, node_number, nodes_at_cluster);
+			*InnerPlan = make_exchange(*InnerPlan, innerFrOpts, false,
+														false, node_number, nodes_at_cluster);
+
+			return outerFrOpts;
+		}
+
+	}
+	else
+	{
+		if (innerFrOpts.attno == inner_frag_attr)
+		{
+			if (outerFrOpts.funcId == innerFrOpts.funcId)
+				return outerFrOpts;
+
+			innerFrOpts.funcId = outerFrOpts.funcId;
+			*InnerPlan = make_exchange(*InnerPlan, innerFrOpts, false,
+											false, node_number, nodes_at_cluster);
+			return outerFrOpts;
+		}
+		else
+		{
+			innerFrOpts.attno = inner_frag_attr;
+			innerFrOpts.funcId = outerFrOpts.funcId;
+			*InnerPlan = make_exchange(*InnerPlan, innerFrOpts, false,
+											false, node_number, nodes_at_cluster);
+			return outerFrOpts;
+		}
+	}
+
+	return innerFrOpts;
 }
 
 static void
@@ -458,7 +653,7 @@ HOOK_Planner_injection(Query *parse, int cursorOptions, ParamListInfo boundParam
 		 * the data.
 		 */
 		Assert(CoordinatorNode >= 0);
-		Assert(innerPlan(stmt->planTree) == NULL);
+//		Assert(innerPlan(stmt->planTree) == NULL);
 		stmt->planTree = make_exchange(stmt->planTree,
 				frOpts, false, false, node_number, nodes_at_cluster);
 	}
