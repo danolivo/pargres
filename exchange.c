@@ -6,6 +6,9 @@
 #include "nodes/makefuncs.h"
 #include "pargres.h"
 
+#include "unistd.h"
+
+
 static CustomScanMethods	exchange_plan_methods;
 static CustomExecMethods	exchange_exec_methods;
 
@@ -13,7 +16,16 @@ static void EXCHANGE_Begin(CustomScanState *node, EState *estate, int eflags);
 static TupleTableSlot *EXCHANGE_Execute(CustomScanState *node);
 static void EXCHANGE_End(CustomScanState *node);
 static void EXCHANGE_Rescan(CustomScanState *node);
-static void EXCHANGE_Explain(CustomScanState *node, List *ancestors, ExplainState *es);
+static void EXCHANGE_ReInitializeDSM(CustomScanState *node, ParallelContext *pcxt,
+		  	  	  	  	 void *coordinate);
+static void EXCHANGE_Explain(CustomScanState *node, List *ancestors,
+							 ExplainState *es);
+static Size EXCHANGE_EstimateDSM(CustomScanState *node, ParallelContext *pcxt);
+static void EXCHANGE_InitializeDSM(CustomScanState *node, ParallelContext *pcxt,
+								   void *coordinate);
+static void EXCHANGE_InitializeWorker(CustomScanState *node,
+									  shm_toc *toc,
+									  void *coordinate);
 static Node *EXCHANGE_Create_state(CustomScan *node);
 
 static int fragmentation_fn_default(int value, int nnodes, int mynum);
@@ -35,10 +47,10 @@ EXCHANGE_Init_methods(void)
 	exchange_exec_methods.ReScanCustomScan			= EXCHANGE_Rescan;
 	exchange_exec_methods.MarkPosCustomScan			= NULL;
 	exchange_exec_methods.RestrPosCustomScan		= NULL;
-	exchange_exec_methods.EstimateDSMCustomScan  	= NULL;
-	exchange_exec_methods.InitializeDSMCustomScan 	= NULL;
-	exchange_exec_methods.InitializeWorkerCustomScan= NULL;
-	exchange_exec_methods.ReInitializeDSMCustomScan = NULL;
+	exchange_exec_methods.EstimateDSMCustomScan  	= EXCHANGE_EstimateDSM;
+	exchange_exec_methods.InitializeDSMCustomScan 	= EXCHANGE_InitializeDSM;
+	exchange_exec_methods.InitializeWorkerCustomScan= EXCHANGE_InitializeWorker;
+	exchange_exec_methods.ReInitializeDSMCustomScan = EXCHANGE_ReInitializeDSM;
 	exchange_exec_methods.ShutdownCustomScan		= NULL;
 	exchange_exec_methods.ExplainCustomScan			= EXCHANGE_Explain;
 }
@@ -77,16 +89,15 @@ EXCHANGE_Create_state(CustomScan *node)
 	state->drop_duplicates = intVal(list_nth(node->custom_private, 3));
 	state->mynode = intVal(list_nth(node->custom_private, 1));
 	state->nnodes = intVal(list_nth(node->custom_private, 0));
+	state->connPool = NULL;
+	state->conn.rsock = NULL;
+	state->conn.wsock = NULL;
 
-	/* Add Pointer to private EXCHANGE data to the list */
-	ExchangeNodesPrivate = lappend(ExchangeNodesPrivate, (Node *)state);
-
-	/* There should be exactly one subplan */
-//	Assert(list_length(node->custom_plans) == 1);
 	Assert(!node->scan.plan.qual);
-
 	return (Node *) state;
 }
+
+static int number=0;
 
 static void
 EXCHANGE_Begin(CustomScanState *node, EState *estate, int eflags)
@@ -101,20 +112,38 @@ EXCHANGE_Begin(CustomScanState *node, EState *estate, int eflags)
 	tupDesc = ExecGetResultType(outerPlanState(node));
 	node->ss.ss_ScanTupleSlot = ExecInitExtraTupleSlot(estate, tupDesc);
 	node->ss.ps.ps_ResultTupleSlot = ExecInitExtraTupleSlot(estate, tupDesc);
-//	ExecAssignProjectionInfo(&state->css.ss.ps, NULL);
 
 	state->NetworkIsActive = true;
 	state->LocalStorageIsActive = true;
 	state->NetworkStorageTuple = 0;
 	state->LocalStorageTuple = 0;
+	state->number = number++;
 
-	state->read_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
-	Assert(state->read_sock != NULL);
-	state->write_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
-	Assert(state->write_sock != NULL);
-	CONN_Init_exchange(state->read_sock, state->write_sock);
+	/* Need to establish connection on the first call */
+	Assert(!state->conn.rsock);
+	Assert(!state->conn.wsock);
 
-//	elog(INFO, "EXCHA2-->");
+	if (!PargresInitialized)
+		/* EXCHANGE_Begin: escape for the worker initialization */
+		return;
+
+	if (!BackendConnInfo)
+	{
+		if (!state->connPool)
+		{
+			/* If this plan not executed by workers, we need to create
+			 * connection pool with one ConnInfo data before initialize read and
+			 * write sockets.
+			 * Otherwise, the connection pool was created by the
+			 * ExecParallelInitializeDSM () function earlier.
+			 */
+			state->connPool = palloc(sizeof(ConnInfoPool));
+			CreateConnectionPool(state->connPool, 1, state->nnodes, state->mynode);
+		}
+		BackendConnInfo = GetConnInfo(state->connPool);
+	}
+
+	CONN_Init_exchange(BackendConnInfo , &state->conn, state->mynode, state->nnodes);
 }
 
 static TupleTableSlot *
@@ -123,12 +152,11 @@ GetTupleFromNetwork(ExchangeState *state, TupleTableSlot *slot, bool *NetworkIsA
 	int res;
 	HeapTuple tuple;
 
-	Assert(state->read_sock > 0);
-	tuple = CONN_Recv(state->read_sock, &res);
+	Assert(state->conn.rsock > 0);
+	tuple = CONN_Recv_any(state->conn.rsock, state->conn.rsIsOpened, &res);
 
 	if (res < 0)
 	{
-//		elog(LOG, "Network off. res=%d", res);
 		*NetworkIsActive = false;
 		return ExecClearTuple(slot);
 	}
@@ -138,7 +166,6 @@ GetTupleFromNetwork(ExchangeState *state, TupleTableSlot *slot, bool *NetworkIsA
 	}
 	else
 	{
-//		elog(LOG, "Tuple Received: t_len=%d", tuple->t_len);
 		ExecStoreHeapTuple(tuple, slot, false);
 		return slot;
 	}
@@ -176,9 +203,8 @@ EXCHANGE_Execute(CustomScanState *node)
 
 			if (TupIsNull(slot))
 			{
-				elog(LOG, "Close all outcoming connections. CoordinatorNode=%d", CoordinatorNode);
-				CONN_Exchange_close(state->write_sock);
-//				elog(LOG, "Close LocalStorageIsActive: state->NetworkIsActive=%u", state->NetworkIsActive);
+				elog(LOG, "Launch CONN_Exchange_close, num=%d", state->number);
+				CONN_Exchange_close(&state->conn);
 				state->LocalStorageIsActive = false;
 			} else
 				state->LocalStorageTuple++;
@@ -208,11 +234,11 @@ EXCHANGE_Execute(CustomScanState *node)
 
 			for (destnode = 0; destnode < nodes_at_cluster; destnode++)
 			{
-				if (state->write_sock[destnode] == PGINVALID_SOCKET)
+				if (state->conn.wsock[destnode] == PGINVALID_SOCKET)
 					continue;
 
-				CONN_Send(state->write_sock[destnode], slot->tts_tuple, tupsize);
-				CONN_Send(state->write_sock[destnode], slot->tts_tuple->t_data, slot->tts_tuple->t_len);
+				CONN_Send(state->conn.wsock[destnode], slot->tts_tuple, tupsize);
+				CONN_Send(state->conn.wsock[destnode], slot->tts_tuple->t_data, slot->tts_tuple->t_len);
 			}
 
 			/* Send tuple to myself */
@@ -230,40 +256,32 @@ EXCHANGE_Execute(CustomScanState *node)
 
 			frfunc = frFuncs(state->frOpts.funcId);
 			val = DatumGetInt32(value);
-//			elog(LOG, "mynode=%d value=%d", state->mynode, val);
+
 			destnode = frfunc(val, state->mynode, state->nnodes);
 		}
 
 		if (destnode == state->mynode)
 			break;
 		else if (state->drop_duplicates)
-		{
-//			elog(LOG, "DROP Duplicates!");
 			continue;
-		}
 		else
 		{
 			int tupsize = offsetof(HeapTupleData, t_data);
-//			elog(LOG, "AGG result natts: %d tuple=%u", slot->tts_tupleDescriptor->natts, slot->tts_tuple == NULL);
 
-//			elog(LOG, "Send Tuple!: tupsize=%d len=%d Oid=%d", tupsize, slot->tts_tuple->t_len, slot->tts_tuple->t_tableOid);
-			Assert(state->write_sock[destnode] > 0);
-			CONN_Send(state->write_sock[destnode], slot->tts_tuple, tupsize);
-			CONN_Send(state->write_sock[destnode], slot->tts_tuple->t_data, slot->tts_tuple->t_len);
-			/* ToDo: Send tuple to corresponding destnode exchange */
+			Assert(state->conn.wsock[destnode] > 0);
+			CONN_Send(state->conn.wsock[destnode], slot->tts_tuple, tupsize);
+			CONN_Send(state->conn.wsock[destnode], slot->tts_tuple->t_data, slot->tts_tuple->t_len);
 			continue;
 		}
 	}
-//	elog(INFO, "EXCHA-->4");
 	return slot;
 }
 
 static void
 EXCHANGE_End(CustomScanState *node)
 {
-//	ExchangeState	*state = (ExchangeState *)node;
-
-//	elog(LOG, "END Exchange: LocalStorageTuple=%d NetworkStorageTuple=%d, CoordinatorNode=%d", state->LocalStorageTuple, state->NetworkStorageTuple, CoordinatorNode);
+	ExchangeState	*state = (ExchangeState *)node;
+	int i;
 
 	/*
 	 * clean out the tuple table
@@ -271,13 +289,65 @@ EXCHANGE_End(CustomScanState *node)
 	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
+	Assert(state->conn.rsock);
+	Assert(state->conn.wsock);
+
+	for (i = 0; i < nodes_at_cluster; i++)
+	{
+		if (i == node_number)
+			continue;
+
+		Assert(state->conn.rsock[i] != PGINVALID_SOCKET);
+		Assert(state->conn.wsock[i] != PGINVALID_SOCKET);
+		if (state->conn.rsIsOpened[i] != false)
+			elog(LOG,
+			"Read socket %d to node %d is not closed. It is explain query?",
+			state->conn.rsock[i], i);
+
+		closesocket(state->conn.rsock[i]);
+		state->conn.rsock[i] = PGINVALID_SOCKET;
+
+		if (state->conn.wsIsOpened[i] != false)
+			elog(LOG,
+			"Write socket %d to node %d is not closed. It is explain query?",
+			state->conn.wsock[i], i);
+
+		closesocket(state->conn.wsock[i]);
+		state->conn.wsock[i] = PGINVALID_SOCKET;
+	}
 	ExecEndNode(outerPlanState(node));
 }
 
 static void
 EXCHANGE_Rescan(CustomScanState *node)
 {
-//	elog(LOG, "I am in EXCHANGE_Rescan()!");
+	PlanState		*outerPlan = outerPlanState(node);
+	ExchangeState	*state = (ExchangeState *)node;
+	int				i;
+
+	if (outerPlan->chgParam == NULL)
+		ExecReScan(outerPlan);
+
+	Assert(state->conn.rsock != NULL);
+	Assert(state->conn.wsock != NULL);
+
+	for (i = 0; i < nodes_at_cluster; i++)
+	{
+		if (i == node_number)
+			continue;
+
+		state->conn.rsIsOpened[i] = true;
+		state->conn.wsIsOpened[i] = true;
+	}
+}
+
+static void
+EXCHANGE_ReInitializeDSM(CustomScanState *node, ParallelContext *pcxt,
+		  	  	  	  	 void *coordinate)
+{
+	/* ToDo */
+	elog(LOG, "I am in ReInitializeDSM()!");
+	Assert(0);
 }
 
 static void
@@ -294,7 +364,7 @@ EXCHANGE_Explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	frOpts.attno = intVal(list_nth(cscan->custom_private, 4));
 	frOpts.funcId = intVal(list_nth(cscan->custom_private, 5));
 	initStringInfo(&str);
-//	nnodes = list_nth(cscan->custom_private, 0);
+
 	appendStringInfo(&str, "attno: %d, funcId: %d, mynode=%d, nnodes=%d, Drop duplicates: %u, bcast: %u",
 					 frOpts.attno,
 					 frOpts.funcId,
@@ -332,7 +402,7 @@ make_exchange(Plan *subplan, fr_options_t frOpts,
 	plan->qual = NIL;
 	plan->lefttree = subplan;
 	plan->righttree = NULL;
-	plan->parallel_aware = false;
+	plan->parallel_aware = true; /* Use Shared Memory in parallel worker */
 	plan->parallel_safe = false;
 	plan->targetlist = NULL;
 
@@ -394,4 +464,46 @@ frFuncs(fr_func_id fid)
 		elog(ERROR, "Undefined function");
 	}
 	return NULL;
+}
+
+static Size
+EXCHANGE_EstimateDSM(CustomScanState *node, ParallelContext *pcxt)
+{
+	return sizeof(ConnInfoPool) * pcxt->nworkers;
+}
+
+static void
+EXCHANGE_InitializeDSM(CustomScanState *node, ParallelContext *pcxt,
+					   void *coordinate)
+{
+	/*
+	 * coordinate - pointer to shared memory segment.
+	 * node->pscan_len - size of the coordinate - is defined by
+	 * EstimateDSMCustomScan() function.
+	 */
+	if (ProcessSharedConnInfoPool.size < 0)
+		CreateConnectionPool(&ProcessSharedConnInfoPool, pcxt->nworkers, nodes_at_cluster, node_number);
+
+	memcpy(coordinate, &ProcessSharedConnInfoPool, sizeof(ConnInfoPool));
+}
+
+static void
+EXCHANGE_InitializeWorker(CustomScanState *node,
+						  shm_toc *toc,
+						  void *coordinate)
+{
+	ExchangeState	*state = (ExchangeState *) node;
+
+	state->connPool = (ConnInfoPool *) coordinate;
+	CoordinatorNode = state->connPool->CoordinatorNode;
+	PargresInitialized = true;
+
+	Assert(!state->conn.rsock);
+	Assert(!state->conn.wsock);
+
+	if (!BackendConnInfo)
+		BackendConnInfo = GetConnInfo(state->connPool);
+
+	elog(LOG, "EXCHANGE_InitializeWorker: mynode=%d nnodes=%d", state->mynode, state->nnodes);
+	CONN_Init_exchange(BackendConnInfo , &state->conn, state->mynode, state->nnodes);
 }

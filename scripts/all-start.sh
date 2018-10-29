@@ -21,9 +21,10 @@ do
 	echo "pargres.node = $node" >> $pgdata_dir/postgresql.conf
 	echo "pargres.nnodes = $1" >> $pgdata_dir/postgresql.conf
 	echo "parallel_setup_cost = 0.0" >> $pgdata_dir/postgresql.conf
-	echo "force_parallel_mode = 'on'" >> $pgdata_dir/postgresql.conf
-	echo "lc_messages='en_US.utf8'" >> $pgdata_dir/postgresql.conf
+	echo "parallel_tuple_cost = 0.0" >> $pgdata_dir/postgresql.conf
+	echo "force_parallel_mode = 'off'" >> $pgdata_dir/postgresql.conf
 	echo "min_parallel_table_scan_size = 0MB" >> $pgdata_dir/postgresql.conf
+	echo "lc_messages='en_US.utf8'" >> $pgdata_dir/postgresql.conf
 	rm logfile$node
 	pg_ctl -c -D $pgdata_dir -l logfile$node -o "-p $port" start
 	createdb -p $port $U

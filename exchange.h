@@ -30,19 +30,18 @@ typedef struct
 typedef struct
 {
 	CustomScanState	css;
-//	Plan			*subplan;
 	fr_options_t	frOpts;
 	bool			drop_duplicates;
 	bool			broadcast_mode;
 	int				mynode;
 	int				nnodes;
-	pgsocket		*read_sock; /* incoming messages */
-	pgsocket		*write_sock; /* outcoming messages */
+	ConnInfoPool	*connPool;
+	ex_conn_t		conn;
 	bool			NetworkIsActive;
 	bool			LocalStorageIsActive;
 	int				LocalStorageTuple;
 	int				NetworkStorageTuple;
-
+	int				number;
 } ExchangeState;
 
 extern void EXCHANGE_Init_methods(void);

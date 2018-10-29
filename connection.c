@@ -27,13 +27,28 @@ MemoryContext	ParGRES_context;
 int node_number;
 int nodes_at_cluster;
 
-static int ExchangePort[NODES_MAX_NUM];
+/* Parameters of coordinator for current query */
+int			CoordinatorPort;
+pgsocket	CoordinatorSock = PGINVALID_SOCKET;
+
+ConnInfoPool ProcessSharedConnInfoPool;
+
+/*
+ * Connection descriptors of Coordinator node for a system message passing.
+ * ServiceSock[CoordinatorNode] setup into listening mode.
+ * Other ServiceSock[] values contains fd of opened socket or PGINVALID_SOCKET.
+ */
+pgsocket	ServiceSock[NODES_MAX_NUM];
+
 static ppgconn *conn = NULL;
 
-NON_EXEC_STATIC pgsocket ExchangeSock = PGINVALID_SOCKET;
+ConnInfo	*BackendConnInfo = NULL;
+
 
 static int _select(int nfds, fd_set *readfds, fd_set *writefds,
 				   struct timeval *timeout);
+static int _accept(pgsocket socket, struct sockaddr *addr,
+				   socklen_t *length_ptr);
 static int _send(int socket, void *buffer, size_t size, int flags);
 static int _recv(int socket, void *buffer, size_t size, int flags);
 
@@ -47,51 +62,135 @@ CONN_Init_module(void)
 }
 
 /*
- * Use system-based choice of free port.
+ * Create, bind and listen socket for the port number.
+ * If port == 0, allocate it by system-based mechanism.
+ * Returns the port, binded with socket.
  */
 int
-CONN_Init_socket(int port)
+ListenPort(int port, pgsocket *sock)
 {
 	struct sockaddr_in	addr;
 	socklen_t			addrlen = sizeof(addr);
+	int					actual_port_num;
+	int					res;
+
+	Assert(sock != NULL);
+	Assert(port >= 0);
 
 	addr.sin_family = AF_INET;
-	addr.sin_port = (in_port_t) port;
+	addr.sin_port =  htons(port);
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-	if (ExchangeSock != PGINVALID_SOCKET)
-		return ExchangePort[node_number];
-
-	/* Setup socket for initial connections */
-	ExchangeSock = socket(addr.sin_family, SOCK_STREAM, 0);
-	Assert(ExchangeSock != PGINVALID_SOCKET);
-	if (bind(ExchangeSock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+	if (*sock == PGINVALID_SOCKET)
 	{
-		perror("bind");
-		return -1;
+		int	optval = 1;
+		int counter = 0;
+
+		*sock = socket(addr.sin_family, SOCK_STREAM, 0);
+		if (*sock < 0)
+			perror("Error on socket creation");
+
+		if(setsockopt(*sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0)
+		    perror("Reusing ADDR failed");
+
+		for (;;)
+		{
+			counter++;
+			res = bind(*sock, (struct sockaddr *)&addr, sizeof(addr));
+
+			if ((res < 0) && (errno == EADDRINUSE))
+			{
+				perror("Error on socket binding");
+				Assert(counter < 10);
+				continue;
+			}
+			else if (res < 0)
+			{
+				perror("Error on socket binding");
+				return -1;
+			}
+
+			break;
+		}
+
+		if (listen(*sock, 1024) != 0)
+		{
+			perror("Error on socket listening");
+			return -1;
+		}
 	}
 
-	if (listen(ExchangeSock, 1024) != 0)
-	{
-		perror("listen");
-		return -1;
-	}
+	getsockname(*sock, (struct sockaddr *)&addr, &addrlen);
+	actual_port_num = ntohs(addr.sin_port);
+	Assert(actual_port_num > 0);
 
-	getsockname(ExchangeSock, (struct sockaddr *)&addr, &addrlen);
-	ExchangePort[node_number] = htons(addr.sin_port);
-	Assert(ExchangePort[node_number] >= 0);
+	if ((port > 0) && (port != actual_port_num))
+		elog(ERROR,
+			 "input port number %d not correspond to actual port number %d",
+			 port, actual_port_num);
 
-	if (!pg_set_noblock(ExchangeSock))
+	if (!pg_set_noblock(*sock))
 		elog(ERROR, "Nonblocking socket failed. ");
 
-	return ExchangePort[node_number];
+	return actual_port_num;
+}
+
+pgsocket
+CONN_Connect(int port, const char *address)
+{
+	pgsocket			sock;
+	struct sockaddr_in	addr;
+	int					res;
+	struct hostent		*server;
+
+
+	sock = socket(AF_INET, SOCK_STREAM, 0);
+	if(sock < 0)
+		perror("ERROR on connect");
+
+	server = gethostbyname(address);
+
+	if (server == NULL)
+		elog(ERROR,"No such host\n");
+
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	addr.sin_addr.s_addr = ((struct in_addr *)server->h_addr_list[0])->s_addr;
+
+	do
+	{
+		res = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+	} while (res < 0 && ((errno == EINTR) || (errno == ECONNREFUSED)));
+
+	if (res < 0)
+		perror("CONNECT");
+
+	return sock;
+}
+
+void
+InstanceConnectionsSetup(void)
+{
+	int i;
+	for (i = 0; i < nodes_at_cluster; i++)
+		ServiceSock[i] = -1;
+
+	CoordinatorPort = ListenPort(0, &ServiceSock[node_number]);
+
+	if (CoordinatorPort <= 0)
+		elog(ERROR,
+			 "Incorrect Service Port number: %d", CoordinatorPort);
+	Assert(ServiceSock[node_number] > 0);
+
+	PostmasterConnectionsSetup();
+	QueryExecutionInitialize(CoordinatorPort);
 }
 
 /*
  * Initialize connections to all another instances
  */
 int
-CONN_Set_all(void)
+PostmasterConnectionsSetup(void)
 {
 	int node;
 	char conninfo[STRING_SIZE_MAX];
@@ -99,6 +198,8 @@ CONN_Set_all(void)
 	if (!conn)
 		/* Also, which set conn[node] to NULL value*/
 		conn = MemoryContextAllocZero(ParGRES_context, sizeof(ppgconn)*nodes_at_cluster);
+
+	Assert(conn[node_number] == NULL);
 
 	for (node = 0; node < nodes_at_cluster; node++)
 	{
@@ -118,55 +219,93 @@ CONN_Set_all(void)
 	return 0;
 }
 
+static void
+accept_connections(pgsocket sock, int cnum, pgsocket *incoming_socks)
+{
+	fd_set readset;
+
+	Assert(sock > 0);
+	Assert(incoming_socks != NULL);
+
+	for (; (cnum > 0); )
+	{
+		FD_ZERO(&readset);
+		FD_SET(sock, &readset);
+
+		if(_select(sock+1, &readset, NULL, NULL) <= 0)
+			perror("select");
+
+		Assert(FD_ISSET(sock, &readset));
+
+		cnum--;
+		incoming_socks[cnum] = _accept(sock, NULL, NULL);
+
+		if (incoming_socks[cnum] < 0)
+			perror("  accept() failed");
+
+		if (!pg_set_noblock(incoming_socks[cnum]))
+			elog(ERROR, "Nonblocking socket failed. ");
+	}
+}
+
+void
+ServiceConnectionSetup(void)
+{
+	if (CoordinatorNode == node_number)
+	{
+		pgsocket	*incoming_socks = palloc((nodes_at_cluster-1)*sizeof(pgsocket));
+		int			i;
+
+		accept_connections(ServiceSock[node_number], nodes_at_cluster-1, incoming_socks);
+		for (i = 0; i < nodes_at_cluster-1; i++)
+		{
+			int nodenum;
+
+			CONN_Recv(incoming_socks, nodes_at_cluster-1, &nodenum, sizeof(int));
+			Assert(nodenum != node_number);
+			ServiceSock[nodenum] = incoming_socks[i];
+		}
+
+		pfree(incoming_socks);
+
+		CoordinatorSock = PGINVALID_SOCKET;
+		CoordinatorPort = -1;
+	}
+	else
+	{
+		CoordinatorSock = CONN_Connect(CoordinatorPort, "localhost");
+		Assert(CoordinatorSock > 0);
+		CONN_Send(CoordinatorSock, &node_number, sizeof(int));
+	}
+}
+
 int
-CONN_Init_execution(void)
+QueryExecutionInitialize(int port)
 {
 	int node;
 	char command[STRING_SIZE_MAX];
-	char ports[STRING_SIZE_MAX] = "";
 
 	Assert(conn != NULL);
 
-	sprintf(command, "SELECT set_query_id(%d);%c", node_number, '\0');
+	sprintf(command, "SELECT set_query_id(%d, %d);%c", node_number, port, '\0');
 
 	for (node = 0; node < nodes_at_cluster; node++)
 	{
-		PGresult *result;
+		int status;
 
 		if (node == node_number)
 			continue;
 
 		Assert(conn[node] != NULL);
+		status = PQsendQuery(conn[node], command);
 
-		result = PQexec(conn[node], command);
-
-		Assert(PQresultStatus(result) != PGRES_FATAL_ERROR);
-		Assert(PQntuples(result) == 1);
-		sscanf(PQgetvalue(result, 0 ,0), "%d", &ExchangePort[node]);
+		if (status == 0)
+			elog(ERROR, "Query sending error: %s", PQerrorMessage(conn[node]));
+		Assert(status > 0);
 	}
 
-	/* Generate string with ports number */
-	for (node = 0; node < nodes_at_cluster; node++)
-	{
-		char port[10];
-
-		sprintf(port, "%d ", ExchangePort[node]);
-		strcat(ports, port);
-	}
-
-	/* Send port numbers to all another nodes */
-	sprintf(command, "SELECT set_exchange_ports('%s');%c", ports, '\0');
-
-	for (node = 0; node < nodes_at_cluster; node++)
-	{
-		PGresult *result;
-
-		if (node == node_number)
-			continue;
-
-		result = PQexec(conn[node], command);
-		Assert(PQresultStatus(result) != PGRES_FATAL_ERROR);
-	}
+	ServiceConnectionSetup();
+	CONN_Check_query_result();
 
 	return 0;
 }
@@ -203,8 +342,6 @@ CONN_Check_query_result(void)
 	if (!conn)
 		return;
 
-//	elog(INFO, "Remote nodes result:");
-
 	do
 	{
 		for (node = 0; node < nodes_at_cluster; node++)
@@ -214,7 +351,8 @@ CONN_Check_query_result(void)
 
 			if ((result = PQgetResult(conn[node])) != NULL)
 			{
-//				elog(INFO, "[%d] status: %s", node, PQcmdStatus(result));
+				elog(LOG, "[%d]: %s", node, PQcmdStatus(result));
+				Assert(PQresultStatus(result) != PGRES_FATAL_ERROR);
 				break;
 			}
 		}
@@ -237,164 +375,103 @@ sendall(int s, char *buf, int len, int flags)
     return (n==-1 ? -1 : total);
 }
 
+static pgsocket BackendExchangeListenSock = PGINVALID_SOCKET;
+
 void
-CONN_Init_exchange(pgsocket *read_sock, pgsocket *write_sock)
+CONN_Init_exchange(ConnInfo *pool, ex_conn_t *exconn, int mynum, int nnodes)
 {
-	int					node;
-	struct sockaddr_in	addr;
-	fd_set				readset;
-	int					res;
-	int					incoming = nodes_at_cluster - 1;
-	int					messages = nodes_at_cluster - 1;
-	pgsocket			*incoming_sock = palloc(sizeof(pgsocket)*nodes_at_cluster);
+	int			node;
+	pgsocket	*incoming_socks = palloc((nnodes - 1) * sizeof(pgsocket));
 
-	Assert(read_sock != NULL);
-	Assert(write_sock != NULL);
-
+	Assert(pool != NULL);
 	elog(LOG, "Start CONN_Init_exchange");
+	exconn->rsock = palloc(sizeof(pgsocket) * nnodes);
+	exconn->rsIsOpened = palloc(sizeof(pgsocket) * nnodes);
+	exconn->wsock = palloc(sizeof(pgsocket) * nnodes);
+	exconn->wsIsOpened = palloc(sizeof(pgsocket) * nnodes);
+	exconn->rsock[mynum] = PGINVALID_SOCKET;
+	exconn->rsIsOpened[mynum] = false;
+	exconn->wsock[mynum] = PGINVALID_SOCKET;
+	exconn->wsIsOpened[mynum] = false;
+
+	if (BackendExchangeListenSock == PGINVALID_SOCKET)
+		ListenPort(pool->port[mynum], &BackendExchangeListenSock);
+
 	/* Init sockets for connection for foreign servers */
-	for (node = 0; node < nodes_at_cluster; node++)
+	for (node = 0; node < nnodes; node++)
 	{
 		if (node == node_number)
-		{
-			write_sock[node] = PGINVALID_SOCKET;
-			read_sock[node] = PGINVALID_SOCKET;
 			continue;
-		}
-
-		write_sock[node] = socket(AF_INET, SOCK_STREAM, 0);
-		if(write_sock[node] < 0)
-			perror("socket");
-
-		addr.sin_family = AF_INET;
-		addr.sin_port = htons(ExchangePort[node]);
-		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-		res = connect(write_sock[node], (struct sockaddr *)&addr, sizeof(addr));
-		if (res < 0)
-			perror("CONNECT");
+		exconn->wsock[node] = CONN_Connect(pool->port[node], "localhost");
+		Assert(exconn->wsock[node] > 0);
 	}
 
-	for (; (incoming > 0); )
+	accept_connections(BackendExchangeListenSock, nnodes-1, incoming_socks);
+	for (node = 0; node < nnodes; node++)
 	{
-		FD_ZERO(&readset);
-		FD_SET(ExchangeSock, &readset);
-
-		if(_select(ExchangeSock+1, &readset, NULL, NULL) <= 0)
-			perror("select");
-
-		Assert(FD_ISSET(ExchangeSock, &readset));
-
-		incoming--;
-		incoming_sock[incoming] = accept(ExchangeSock, NULL, NULL);
-		if (incoming_sock[incoming] < 0)
-		{
-			if (errno != EWOULDBLOCK)
-			{
-				perror("  accept() failed");
-			}
-
-		}
-		if (!pg_set_noblock(incoming_sock[incoming]))
-			elog(ERROR, "Nonblocking socket failed. ");
-	}
-
-	for (node = 0; node < nodes_at_cluster; node++)
-	{
-		int buf = node_number;
-
 		if (node == node_number)
 			continue;
 
-		Assert(write_sock[node] > 0);
-		sendall(write_sock[node], (char *)&buf, sizeof(int), 0);
+		exconn->wsIsOpened[node] = true;
+		CONN_Send(exconn->wsock[node], &node_number, sizeof(int));
 	}
 
-	while (messages > 0)
+	for (node = 0; node < nnodes-1; node++)
 	{
-		int high_sock = 0;
+		int nodenum;
 
-		FD_ZERO(&readset);
-		for (node = 0; node < nodes_at_cluster-1; node++)
-		{
-			FD_SET(incoming_sock[node], &readset);
+		CONN_Recv(&incoming_socks[node], 1, &nodenum, sizeof(int));
 
-			if (high_sock < incoming_sock[node])
-				high_sock = incoming_sock[node];
-		}
-		if(_select(high_sock+1, &readset, NULL, NULL) <= 0)
-			perror("select");
-
-		for (node = 0; node < nodes_at_cluster-1; node++)
-		{
-			int	nodeID = 0;
-			int	bytes_read;
-
-			if (FD_ISSET(incoming_sock[node], &readset))
-			{
-				bytes_read = _recv(incoming_sock[node], &nodeID, sizeof(int), 0);
-				if (bytes_read != sizeof(int))
-					elog(LOG, "EE bytes_read=%d", bytes_read);
-				Assert(bytes_read == sizeof(int));
-				Assert((nodeID >= 0) && (nodeID <nodes_at_cluster));
-				read_sock[nodeID] = incoming_sock[node];
-
-				messages--;
-			}
-		}
+		Assert(nodenum != node_number);
+		exconn->rsock[nodenum] = incoming_socks[node];
+		exconn->rsIsOpened[nodenum] = true;
 	}
 
-	for (node = 0; node < nodes_at_cluster-1; node++)
-		if (node != node_number)
-		{
-			Assert(read_sock[node] > 0);
-			Assert(write_sock[node] > 0);
-		}
-	elog(LOG, "Connections Established");
-	pfree(incoming_sock);
+	pfree(incoming_socks);
 }
 
 void
-CONN_Exchange_close(pgsocket *write_sock)
+OnExecutionEnd(void)
+{
+	if (BackendExchangeListenSock != PGINVALID_SOCKET)
+	{
+		if (closesocket(BackendExchangeListenSock) < 0)
+			perror("CLOSE");
+		BackendExchangeListenSock = PGINVALID_SOCKET;
+
+		Assert((BackendConnInfo->port[node_number] > 0) && (BackendConnInfo->port[node_number] < PG_UINT16_MAX));
+		STACK_Push(PORTS, BackendConnInfo->port[node_number]);
+		BackendConnInfo = NULL;
+	}
+	else
+	{
+		/* For EXPLAIN operation */
+	}
+}
+
+void
+CONN_Exchange_close(ex_conn_t *conn)
 {
 	int node;
+
+	Assert(conn != NULL);
 
 	for (node = 0; node < nodes_at_cluster; node++)
 	{
 		char close_sig = 'C';
 
-		if (write_sock[node] == PGINVALID_SOCKET)
+		if (conn->wsIsOpened[node] == false)
 			continue;
 
-		Assert(write_sock[node] > 0);
-		CONN_Send(write_sock[node], &close_sig, 1);
-
-		closesocket(write_sock[node]);
-		write_sock[node] = PGINVALID_SOCKET;
+		Assert(conn->wsock[node] > 0);
+		CONN_Send(conn->wsock[node], &close_sig, 1);
+		conn->wsIsOpened[node] = false;
 	}
-//	elog(LOG, "Close write_sock[] connections");
-}
-
-void
-CONN_Parse_ports(char *ports)
-{
-	int node = 0;
-	char *token = strtok(ports, " ");
-
-	while (token != NULL)
-	{
-		 sscanf(token, "%d\n", &ExchangePort[node]);
-		 token = strtok(NULL, " ");
-//		 elog(LOG, "ExchangePort[%d]: %d", node, ExchangePort[node]);
-		 node++;
-	}
-
-	Assert(node == nodes_at_cluster);
 }
 
 int
 CONN_Send(pgsocket sock, void *buf, int size)
 {
-//	fd_set writeset;
 	Assert(sock != PGINVALID_SOCKET);
 	if (sendall(sock, (char *)buf, size, 0) < 0)
 	{
@@ -415,6 +492,19 @@ _select(int nfds, fd_set *readfds, fd_set *writefds,
 	do
 	{
 		res = select(nfds, readfds, writefds, NULL, timeout);
+	} while (res < 0 && errno == EINTR);
+
+	return res;
+}
+
+static int
+_accept(pgsocket socket, struct sockaddr *addr, socklen_t *length_ptr)
+{
+	int res;
+
+	do
+	{
+		res = accept(socket, addr, length_ptr);
 	} while (res < 0 && errno == EINTR);
 
 	return res;
@@ -446,17 +536,43 @@ _recv(int socket, void *buffer, size_t size, int flags)
 	return res;
 }
 
+int
+CONN_Recv(pgsocket *socks, int nsocks, void *buf, int expected_size)
+{
+	fd_set	readset;
+	int		high_sock = 0;
+	int		i;
+
+	FD_ZERO(&readset);
+	for (i = 0; i < nsocks; i++)
+	{
+		Assert(socks[i] > 0);
+		FD_SET(socks[i], &readset);
+
+		if (high_sock < socks[i])
+			high_sock = socks[i];
+	}
+
+	if(_select(high_sock+1, &readset, NULL, NULL) <= 0)
+		perror("RECV Select error");
+
+	for (i = 0; (i < nsocks) && !FD_ISSET(socks[i], &readset); i++);
+	Assert(i < nsocks);
+
+	return _recv(socks[i], buf, expected_size, 0);
+}
+
 HeapTuple
-CONN_Recv(pgsocket *socks, int *res)
+CONN_Recv_any(pgsocket *socks, bool *isopened,  int *res)
 {
 	int				i;
 	struct timeval	timeout;
 	HeapTupleData	htHeader;
 	HeapTuple		tuple;
 	fd_set readset;
-	int high_sock = 0;
 
 	Assert(socks != NULL);
+	Assert(isopened != NULL);
 	Assert(res != NULL);
 
 	timeout.tv_sec = 0;
@@ -470,13 +586,16 @@ CONN_Recv(pgsocket *socks, int *res)
 	 */
 	for (;;)
 	{
+		int high_sock = 0;
+
 		FD_ZERO(&readset);
 
 		for (i = 0; i < nodes_at_cluster; i++)
 		{
-			if (socks[i] == PGINVALID_SOCKET)
+			if (!isopened[i])
 				continue;
 
+			Assert(socks[i] > 0);
 			if (high_sock < socks[i])
 				high_sock = socks[i];
 
@@ -495,15 +614,16 @@ CONN_Recv(pgsocket *socks, int *res)
 
 		if (*res < 0)
 		{
-			perror("READ SELECT ERROR");
+			perror("SELECT ERROR");
 		}
 		else if (*res == 0)
+			/* No one message was arrived */
 			return NULL;
 
 		/* Search for socket triggered */
 		for (i = 0; i < nodes_at_cluster; i++)
 		{
-			if (socks[i] == PGINVALID_SOCKET)
+			if (!isopened[i])
 				continue;
 
 			if (FD_ISSET(socks[i], &readset))
@@ -529,9 +649,8 @@ CONN_Recv(pgsocket *socks, int *res)
 				}
 				else if (*res == 1)
 				{
-					elog(LOG, "CONN_Recv: close connection %d", i);
-					closesocket(socks[i]);
-					socks[i] = PGINVALID_SOCKET;
+					elog(LOG, "READ SOCK Close: %d (%d)", socks[i], i);
+					isopened[i] = false;
 					continue;
 				}
 				else if (*res < 0)
@@ -546,4 +665,73 @@ CONN_Recv(pgsocket *socks, int *res)
 	}
 	Assert(0);
 	return NULL;
+}
+
+ConnInfo*
+GetConnInfo(ConnInfoPool *pool)
+{
+	int current;
+
+	Assert(pool != NULL);
+
+	current = pg_atomic_fetch_add_u32(&pool->current, 1);
+	Assert(current != pool->size);
+	return &pool->info[current];
+}
+
+/*
+ * Call by Leader backend at initialization process of shared memory for
+ * parallel workers.
+ */
+void
+CreateConnectionPool(ConnInfoPool *pool, int nconns, int nnodes, int mynode)
+{
+	int i;
+
+	Assert(pool != NULL);
+	Assert(nconns > 0);
+	Assert(nnodes > 0);
+	Assert((mynode >= 0) && (mynode < nnodes));
+
+	pool->CoordinatorNode = CoordinatorNode;
+
+	for (i = 0; i < nconns; i++)
+	{
+		int j;
+
+		if (mynode == CoordinatorNode)
+		{
+			pool->info[i].port[mynode] = STACK_Pop(PORTS);
+
+			Assert((pool->info[i].port[mynode] > 0) && (pool->info[i].port[mynode] < PG_UINT16_MAX));
+
+			for (j = 0; j < nnodes; j++)
+			{
+				if (j == mynode)
+					continue;
+
+				CONN_Recv(&ServiceSock[j], 1, &(pool->info[i].port[j]), sizeof(int));
+			}
+
+			for (j = 0; j < nnodes; j++)
+			{
+				if (j == node_number)
+					continue;
+				Assert(ServiceSock[j] > 0);
+				CONN_Send(ServiceSock[j], pool->info[i].port, nnodes*sizeof(int));
+			}
+		}
+		else
+		{
+			int port = STACK_Pop(PORTS);
+
+			Assert((port > 0) && (port < PG_UINT16_MAX));
+			Assert(CoordinatorSock > 0);
+
+			CONN_Send(CoordinatorSock, &port, sizeof(int));
+			CONN_Recv(&CoordinatorSock, 1, pool->info[i].port, nnodes*sizeof(int));
+		}
+	}
+	pg_atomic_write_u32(&pool->current, 0);
+	pool->size = nconns;
 }

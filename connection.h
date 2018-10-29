@@ -9,23 +9,63 @@
 #define CONNECTION_H_
 
 #include "access/htup.h"
+#include "port/atomics.h"
 
-extern int node_number;
-extern int nodes_at_cluster;
 
 #define NODES_MAX_NUM	(1024)
 #define STRING_SIZE_MAX	(1024)
 
+
+
+typedef struct
+{
+	int	port[NODES_MAX_NUM];
+} ConnInfo;
+
+#define POOL_MAX_SIZE		(10)
+
+typedef struct
+{
+	int					size;
+	pg_atomic_uint32	current;
+	int					CoordinatorNode;
+	ConnInfo			info[POOL_MAX_SIZE];
+} ConnInfoPool;
+
+typedef struct
+{
+	pgsocket	*rsock; /* incoming messages */
+	bool		*rsIsOpened;
+	pgsocket	*wsock; /* outcoming messages */
+	bool		*wsIsOpened;
+} ex_conn_t;
+
+extern ConnInfo	*BackendConnInfo;
+extern int		node_number;
+extern int		nodes_at_cluster;
+extern int		CoordinatorPort;
+extern pgsocket	CoordinatorSock;
+extern pgsocket	ServiceSock[NODES_MAX_NUM];
+extern ConnInfoPool ProcessSharedConnInfoPool;
+
+
 extern void CONN_Init_module(void);
-extern int CONN_Init_socket(int port);
-extern int CONN_Set_all(void);
-extern int CONN_Init_execution(void);
+extern void InstanceConnectionsSetup(void);
+extern int ListenPort(int port, pgsocket *sock);
+extern pgsocket CONN_Connect(int port, const char *address);
+extern int PostmasterConnectionsSetup(void);
+extern int QueryExecutionInitialize(int port);
 extern int CONN_Launch_query(const char *query);
 extern void CONN_Check_query_result(void);
-extern void CONN_Init_exchange(pgsocket *read_sock, pgsocket *write_sock);
-extern void CONN_Exchange_close(pgsocket *write_sock);
-extern void CONN_Parse_ports(char *ports);
+extern void CONN_Init_exchange(ConnInfo *pool, ex_conn_t *exconn, int mynum,
+																  int nnodes);
+extern void CONN_Exchange_close(ex_conn_t *conn);
 extern int CONN_Send(pgsocket sock, void *buf, int size);
-extern HeapTuple CONN_Recv(pgsocket *socks, int *res);
+extern int CONN_Recv(pgsocket *socks, int nsocks, void *buf, int expected_size);
+extern HeapTuple CONN_Recv_any(pgsocket *socks, bool *isopened, int *res);
+extern void ServiceConnectionSetup(void);
+extern void OnExecutionEnd(void);
+extern ConnInfo* GetConnInfo(ConnInfoPool *pool);
+extern void CreateConnectionPool(ConnInfoPool *pool, int nconns, int nnodes, int mynode);
 
 #endif /* CONNECTION_H_ */

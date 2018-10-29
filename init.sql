@@ -10,18 +10,10 @@ CREATE TABLE IF NOT EXISTS @extschema@.relsfrag (
 -- set_query_id()
 --
 CREATE OR REPLACE FUNCTION @extschema@.set_query_id(
-					nodeID	INT)
-RETURNS INT
-AS 'MODULE_PATHNAME', 'set_query_id'
-LANGUAGE C STRICT;
-
---
--- set_exchange_ports()
---
-CREATE OR REPLACE FUNCTION @extschema@.set_exchange_ports(
-					ports	TEXT)
+					CoordinatorNode	INT,
+					ServicePort		INT)
 RETURNS VOID
-AS 'MODULE_PATHNAME', 'set_exchange_ports'
+AS 'MODULE_PATHNAME', 'set_query_id'
 LANGUAGE C STRICT;
 
 CREATE OR REPLACE FUNCTION @extschema@.isLocalValue(

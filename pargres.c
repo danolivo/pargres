@@ -10,6 +10,7 @@
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
 #include "parser/parsetree.h"
+#include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
@@ -26,7 +27,6 @@
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(set_query_id);
-PG_FUNCTION_INFO_V1(set_exchange_ports);
 PG_FUNCTION_INFO_V1(isLocalValue);
 
 /*
@@ -53,6 +53,7 @@ FragRels	frRelations[1000];
 static ProcessUtility_hook_type 	next_ProcessUtility_hook = NULL;
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 static planner_hook_type			prev_planner_hook = NULL;
+static shmem_startup_hook_type		prev_shmem_startup_hook = NULL;
 
 static void HOOK_Parser_injection(ParseState *pstate, Query *query);
 static PlannedStmt *HOOK_Planner_injection(Query *parse, int cursorOptions,
@@ -69,7 +70,41 @@ static void create_table_frag(const char *relname, int attno, fr_func_id fid);
 static void load_description_frag(void);
 static fr_options_t getRelFrag(const char *relname);
 
-#define NODES_MAX_NUM	(1024)
+#define NODES_MAX_NUM		(1024)
+
+static Size
+PortStackShmemSize(void)
+{
+	return sizeof(PortStack);
+}
+
+/*
+ * PortStackShmemInit --- initialize this module's shared memory
+ */
+static void
+HOOK_Shmem_injection(void)
+{
+	bool	found;
+	int		tranche_id;
+
+	PORTS = (PortStack *) ShmemInitStruct("Port Stack State",
+										  PortStackShmemSize(),
+										  &found);
+
+	tranche_id = LWLockNewTrancheId();
+	LWLockRegisterTranche(tranche_id, (char*)"PortStackLocker");
+	LWLockInitialize(&PORTS->lock, tranche_id);
+
+	if (!IsUnderPostmaster)
+	{
+		/* Initialize shared memory area */
+		Assert(!found);
+		STACK_Init(PORTS, 8000+node_number*MAX_EXCHANGE_PORTS, MAX_EXCHANGE_PORTS);
+	}
+	else
+		Assert(found);
+}
+
 /*
 static void
 set_sequence_options(CreateSeqStmt *seq, int nnum)
@@ -105,6 +140,13 @@ PLAN_Hooks_init(void)
 {
 	prev_planner_hook	= planner_hook;
 	planner_hook		= HOOK_Planner_injection;
+}
+
+static void
+SHMEM_Hooks_init(void)
+{
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = HOOK_Shmem_injection;
 }
 
 static fr_options_t
@@ -189,32 +231,39 @@ traverse_qual_list(Expr *node, int inner_attno, int outer_attno, int rec)
 	{
 		case T_Var:
 		{
+			/*
+			 * Qual Attribute was found. We need to
+			 */
 			Var *variable = (Var *) node;
-
+//elog(INFO, "variable->varattno=%d", variable->varattno);
 			if (variable->varattno <= 0)
 			{
 				/* Do not process whole-row or system columns var */
-				elog(ERROR, "Qual list: Not used varattno: %d", variable->varattno);
+//				elog(ERROR, "Qual list: Not used varattno: %d", variable->varattno);
 				break;
 			}
 			else if (variable->varno == INNER_VAR)
 			{
-				if (variable->varattno != inner_attno)
-				{
+//				if (variable->varattno != inner_attno)
+//				{
 //					elog(INFO, "variable->varattno = %d", variable->varattno);
 					inner_frag_attr = (inner_frag_attr == 0) ?
 										variable->varattno : -1;
-				}
+//				}
 			}
 			else if (variable->varno == OUTER_VAR)
 			{
-				if (variable->varattno != outer_attno)
-				{
-	//				elog(INFO, "variable->varattno = %d", variable->varattno);
+//				if (variable->varattno != outer_attno)
+//				{
+//					elog(INFO, "variable->varattno = %d", variable->varattno);
 					outer_frag_attr = (outer_frag_attr == 0) ?
 										variable->varattno : -1;
-				}
+//				}
 			}
+			else
+				/* Now we can't support INDEX_VAR option */
+				Assert(0);
+
 			break;
 		}
 
@@ -285,7 +334,7 @@ static void
 vars(List *qual)
 {
 	ListCell   *lc;
-
+elog(INFO, "JOIN Quals: %d", list_length(qual));
 	foreach(lc, qual)
 	{
 		Expr *node = (Expr *) lfirst(lc);
@@ -340,6 +389,7 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 		else if (nodeTag(root) == T_MergeJoin)
 					vars(((MergeJoin *) root)->mergeclauses);
 		else
+			/* Nested Loop Join */
 			vars(((Join *) root)->joinqual);
 //		elog(INFO, "frag_attr: %u %u", inner_frag_attr, outer_frag_attr);
 
@@ -396,10 +446,7 @@ changeJoinPlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 		InnerPlan = &outerPlan(innerPlan(plan));
 	}
 	else
-	{
 		InnerPlan = &innerPlan(plan);
-//		elog(INFO, "-------------------ERROR!------------");
-	}
 
 	if ((inner_frag_attr < 0) || (outer_frag_attr < 0))
 	{
@@ -421,18 +468,10 @@ changeJoinPlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 		}
 		else
 		{
-			outerFrOpts.attno = outer_frag_attr;
-			innerFrOpts.attno = inner_frag_attr;
-			innerFrOpts.funcId = outerFrOpts.funcId;
-	//		elog(INFO, "-------------------INSERT!------------ %d %d %d %d", nodeTag(*InnerPlan), nodeTag(plan), nodeTag(outerPlan(plan)), nodeTag(innerPlan(plan)));
-			outerPlan(plan) = make_exchange(outerPlan(plan), outerFrOpts, false,
-											false, node_number, nodes_at_cluster);
-			*InnerPlan = make_exchange(*InnerPlan, innerFrOpts, false,
-														false, node_number, nodes_at_cluster);
-
+			*InnerPlan = make_exchange(*InnerPlan, outerFrOpts, false,
+									   true, node_number, nodes_at_cluster);
 			return outerFrOpts;
 		}
-
 	}
 	else
 	{
@@ -553,16 +592,6 @@ HOOK_Utility_injection(PlannedStmt *pstmt,
 											context, params, queryEnv,
 											dest, completionTag);
 	CONN_Check_query_result();
-
-	if ((nodeTag(parsetree) == T_CopyStmt) && (CoordinatorNode == node_number))
-	{
-		CopyStmt *cpy = (CopyStmt *) parsetree;
-//		elog(LOG, "Post COPY opts: from=%u relname=%s", cpy->is_from, cpy->relation->relname);
-		if ((cpy->is_from) && (cpy->relation))
-		{
-//			Do_Refragment_relation(cpy->relation->relname);
-		}
-	}
 }
 
 /*
@@ -574,7 +603,6 @@ HOOK_Parser_injection(ParseState *pstate, Query *query)
 	if (prev_post_parse_analyze_hook)
 		prev_post_parse_analyze_hook(pstate, query);
 
-//	elog(LOG, "Parser Injection start");
 	if ((query->commandType == CMD_UTILITY) && (nodeTag(query->utilityStmt) == T_CopyStmt))
 		return;
 
@@ -590,36 +618,21 @@ HOOK_Parser_injection(ParseState *pstate, Query *query)
 		return;
 	}
 
-	if (strstr(pstate->p_sourcetext, "set_exchange_ports(") != NULL)
-	{
-		PargresInitialized = false;
-		return;
-	}
-
 	if (CoordinatorNode < 0)
+	{
+		/* Executed only by coordinator at first query in a session. */
 		CoordinatorNode = node_number;
 
-	/*
-	 * If we will use backends pool this will be not working correctly.
-	 */
-	if (CoordinatorNode != node_number)
-		return;
+		/* Establish connections to all another instances. */
+		InstanceConnectionsSetup();
+	}
 
 	/*
-	 * We setup listener socket before connection. After Query sending backends
-	 * from other nodes will set connection to me.
+	 * Send Query to another instances. Ideally, we must send a plan of the
+	 * query.
 	 */
-	CONN_Init_socket(0);
-
-	/* Init connection */
-	if (CONN_Set_all() < 0)
-		return;
-
-	/* Send CoordinatorId and query tag */
-	CONN_Init_execution();
-
-	CONN_Launch_query(pstate->p_sourcetext);
-//	elog(LOG, "Parser Injection Finish");
+	if (CoordinatorNode == node_number)
+		CONN_Launch_query(pstate->p_sourcetext);
 }
 
 PlannedStmt *
@@ -703,6 +716,7 @@ _PG_init(void)
 
 	PLAN_Hooks_init();
 	EXEC_Hooks_init();
+	SHMEM_Hooks_init();
 
 	CONN_Init_module();
 }
@@ -793,21 +807,17 @@ load_description_frag(void)
 Datum
 set_query_id(PG_FUNCTION_ARGS)
 {
-	int port;
+//	int res;
+
 	CoordinatorNode = PG_GETARG_INT32(0);
+	CoordinatorPort = 	PG_GETARG_INT32(1);
 
-	port = CONN_Init_socket(0);
-	Assert(port >= 0);
+	Assert((CoordinatorNode >=0) && (CoordinatorNode < nodes_at_cluster));
+	Assert((CoordinatorPort > 0) && (CoordinatorPort < PG_UINT16_MAX));
 
-	PG_RETURN_INT32(port);
-}
+	ServiceConnectionSetup();
 
-Datum set_exchange_ports(PG_FUNCTION_ARGS)
-{
-	/* Parse input string to exchange node ports */
-	char	*ports = TextDatumGetCString(PG_GETARG_DATUM(0));
-
-	CONN_Parse_ports(ports);
+	Assert(CoordinatorSock > 0);
 	PG_RETURN_VOID();
 }
 
