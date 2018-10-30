@@ -161,18 +161,15 @@ get_fragmentation(Oid relid)
 		int i = 0;
 
 		relname = RelationGetRelationName(relation);
-//		elog(LOG, "START nfrRelations=%d, %s", nfrRelations, relname);
+
 		while ((i < nfrRelations) &&
 			   (strcmp(frRelations[i].relname, relname) != 0))
-		{
-//			elog(LOG, "nfrRelations=%d, %s", nfrRelations, frRelations[i].relname);
 			i++;
-		}
+
 		if (i == nfrRelations)
 			elog(LOG, "Relation %s (relid=%d) not distributed!", relname, relid);
 		else
 		{
-//			elog(LOG, "Distribution relid=%d found!", relid);
 			if (frRelations[i].relid == InvalidOid)
 				frRelations[i].relid = relid;
 			result = frRelations[i].frOpts;
@@ -219,8 +216,8 @@ isEqualFragmentation(const fr_options_t *frOpts1, const fr_options_t *frOpts2)
 	return true;
 }
 
-static int inner_frag_attr;
-static int outer_frag_attr;
+static int inner_join_attr;
+static int outer_join_attr;
 
 static void
 traverse_qual_list(Expr *node, int inner_attno, int outer_attno, int rec)
@@ -235,30 +232,23 @@ traverse_qual_list(Expr *node, int inner_attno, int outer_attno, int rec)
 			 * Qual Attribute was found. We need to
 			 */
 			Var *variable = (Var *) node;
-//elog(INFO, "variable->varattno=%d", variable->varattno);
+
 			if (variable->varattno <= 0)
 			{
 				/* Do not process whole-row or system columns var */
-//				elog(ERROR, "Qual list: Not used varattno: %d", variable->varattno);
 				break;
 			}
 			else if (variable->varno == INNER_VAR)
 			{
-//				if (variable->varattno != inner_attno)
-//				{
-//					elog(INFO, "variable->varattno = %d", variable->varattno);
-					inner_frag_attr = (inner_frag_attr == 0) ?
+//					elog(INFO, "INNER: variable->varattno = %d", variable->varattno);
+					inner_join_attr = (inner_join_attr == 0) ?
 										variable->varattno : -1;
-//				}
 			}
 			else if (variable->varno == OUTER_VAR)
 			{
-//				if (variable->varattno != outer_attno)
-//				{
-//					elog(INFO, "variable->varattno = %d", variable->varattno);
-					outer_frag_attr = (outer_frag_attr == 0) ?
+//					elog(INFO, "OUTER: variable->varattno = %d", variable->varattno);
+					outer_join_attr = (outer_join_attr == 0) ?
 										variable->varattno : -1;
-//				}
 			}
 			else
 				/* Now we can't support INDEX_VAR option */
@@ -322,8 +312,14 @@ traverse_qual_list(Expr *node, int inner_attno, int outer_attno, int rec)
 			break;
 
 		}
-
-
+		/* For debug purposes only */
+		case T_TargetEntry:
+		{
+			TargetEntry	*entry = (TargetEntry *) node;
+			Expr		*arg = entry->expr;
+			traverse_qual_list(arg, inner_attno, outer_attno, rec+1);
+			break;
+		}
 		case T_Const:
 		default:
 			break;
@@ -334,7 +330,7 @@ static void
 vars(List *qual)
 {
 	ListCell   *lc;
-elog(INFO, "JOIN Quals: %d", list_length(qual));
+
 	foreach(lc, qual)
 	{
 		Expr *node = (Expr *) lfirst(lc);
@@ -342,6 +338,7 @@ elog(INFO, "JOIN Quals: %d", list_length(qual));
 		traverse_qual_list(node, 1, 1, 0);
 	}
 }
+
 /*
  * Traverse the tree, analyze fragmentation and insert EXCHANGE nodes
  * to redistribute tuples for correct execution.
@@ -381,8 +378,8 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 	case T_MergeJoin:
 	case T_NestLoop:
 	{
-		inner_frag_attr = 0;
-		outer_frag_attr = 0;
+		inner_join_attr = 0;
+		outer_join_attr = 0;
 
 		if (nodeTag(root) == T_HashJoin)
 			vars(((HashJoin *) root)->hashclauses);
@@ -391,10 +388,8 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 		else
 			/* Nested Loop Join */
 			vars(((Join *) root)->joinqual);
-//		elog(INFO, "frag_attr: %u %u", inner_frag_attr, outer_frag_attr);
 
-		changeJoinPlan(root, stmt, innerFrOpts, outerFrOpts);
-		break;
+		return changeJoinPlan(root, stmt, innerFrOpts, outerFrOpts);
 	}
 	default:
 		if (!isNullFragmentation(&innerFrOpts) && !isNullFragmentation(&outerFrOpts))
@@ -411,6 +406,67 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 	}
 
 	return NO_FRAGMENTATION;
+}
+
+static int
+attnum_after_join(List *targetlist, int attnum, int isInner)
+{
+	ListCell	*lc;
+	int			new_attnum = 0;
+
+	Assert(targetlist != NULL);
+	Assert(attnum > 0);
+
+//	elog(INFO, "JOIN targetlist size: %d", list_length(targetlist));
+	for ((lc) = list_head(targetlist); (lc) != NULL; (lc) = lnext(lc))
+	{
+		TargetEntry	*entry = (TargetEntry *) lfirst(lc);
+		Expr		*arg = entry->expr;
+
+		if (arg == NULL)
+			continue;
+
+		new_attnum++;
+		if (nodeTag(arg) == T_Var)
+		{
+			Var *variable = (Var *) arg;
+//			elog(INFO, "arg exists %d isinner=%hhu (%d new=%d att=%d old=%d)", nodeTag(arg), isInner, variable->varno, variable->varattno, attnum,  variable->varoattno);
+			if ((((isInner) && (variable->varno == INNER_VAR)) ||
+				((!isInner) && (variable->varno == OUTER_VAR))) &&
+				(variable->varattno == attnum))
+				return new_attnum;
+		}
+	}
+	return -1;
+}
+
+/*
+ * Locate new position of distribution attribute in result set of JOINed tuples
+ */
+static fr_options_t
+get_new_frfn(List *targetlist, fr_options_t *innerFrOpts, fr_options_t *outerFrOpts)
+{
+	int new_attnum = 0;
+
+	Assert(targetlist != NULL);
+	Assert((outerFrOpts != NULL) || (innerFrOpts != NULL));
+
+	/* Get new position of fragmentation attribute */
+	if (innerFrOpts != NULL)
+		new_attnum = attnum_after_join(targetlist, innerFrOpts->attno, true);
+
+	if ((new_attnum <= 0) && (outerFrOpts != NULL))
+		new_attnum = attnum_after_join(targetlist, outerFrOpts->attno, false);
+
+	if (new_attnum < 0)
+		return NO_FRAGMENTATION;
+
+	Assert(new_attnum > 0);
+	if ((innerFrOpts != NULL) && (outerFrOpts != NULL))
+		Assert(outerFrOpts->funcId == innerFrOpts->funcId);
+
+	outerFrOpts->attno = new_attnum;
+	return *outerFrOpts;
 }
 
 static void
@@ -448,54 +504,65 @@ changeJoinPlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 	else
 		InnerPlan = &innerPlan(plan);
 
-	if ((inner_frag_attr < 0) || (outer_frag_attr < 0))
+	if ((inner_join_attr < 0) || (outer_join_attr < 0))
 	{
 		/* Join by more than one attribute. Broadcast inner table to all nodes */
 		*InnerPlan = make_exchange(*InnerPlan, outerFrOpts, false,
 										true, node_number, nodes_at_cluster);
-		return outerFrOpts;
+
+		/* Inner relation broadcasting drops its distribution rule */
+		return get_new_frfn(plan->targetlist, NULL, &outerFrOpts);
 	}
 
-	if (outerFrOpts.attno != outer_frag_attr)
+	if (outerFrOpts.attno != outer_join_attr)
 	{
-		if (innerFrOpts.attno == inner_frag_attr)
+		if (innerFrOpts.attno == inner_join_attr)
 		{
-			outerFrOpts.attno = outer_frag_attr;
+			/* Need to redistribute outer relation */
+			outerFrOpts.attno = outer_join_attr;
 			outerFrOpts.funcId = innerFrOpts.funcId;
 			outerPlan(plan) = make_exchange(outerPlan(plan), outerFrOpts, false,
 											false, node_number, nodes_at_cluster);
-			return outerFrOpts;
+
+			return get_new_frfn(plan->targetlist, &innerFrOpts, &outerFrOpts);
 		}
 		else
 		{
 			*InnerPlan = make_exchange(*InnerPlan, outerFrOpts, false,
 									   true, node_number, nodes_at_cluster);
-			return outerFrOpts;
+
+			/* Inner relation broadcasting drops its distribution rule */
+			return get_new_frfn(plan->targetlist, NULL, &outerFrOpts);
 		}
 	}
 	else
 	{
-		if (innerFrOpts.attno == inner_frag_attr)
+		/* Outer relation distributed by join attribute */
+		if (innerFrOpts.attno == inner_join_attr)
 		{
 			if (outerFrOpts.funcId == innerFrOpts.funcId)
-				return outerFrOpts;
+				/*
+				 * Inner and outer relations distributed by its fragmentation
+				 * attributes.
+				 */
+				return get_new_frfn(plan->targetlist, &innerFrOpts, &outerFrOpts);
 
 			innerFrOpts.funcId = outerFrOpts.funcId;
 			*InnerPlan = make_exchange(*InnerPlan, innerFrOpts, false,
 											false, node_number, nodes_at_cluster);
-			return outerFrOpts;
+
+			return get_new_frfn(plan->targetlist, &innerFrOpts, &outerFrOpts);
 		}
 		else
 		{
-			innerFrOpts.attno = inner_frag_attr;
+			innerFrOpts.attno = inner_join_attr;
 			innerFrOpts.funcId = outerFrOpts.funcId;
 			*InnerPlan = make_exchange(*InnerPlan, innerFrOpts, false,
 											false, node_number, nodes_at_cluster);
-			return outerFrOpts;
+
+			return get_new_frfn(plan->targetlist, &innerFrOpts, &outerFrOpts);
 		}
 	}
-
-	return innerFrOpts;
 }
 
 static void
@@ -527,7 +594,7 @@ changeModifyTablePlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 					get_fragmentation(resultRelationOid), false, false, node_number, nodes_at_cluster);
 	}
 }
-
+/*
 static void
 Do_Refragment_relation(const char *relname)
 {
@@ -552,7 +619,7 @@ Do_Refragment_relation(const char *relname)
 	result = PQexec(conn, command);
 	Assert(PQresultStatus(result) != PGRES_FATAL_ERROR);
 }
-
+*/
 /*
  * HOOK_Utility_injection
  *
