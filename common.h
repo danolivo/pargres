@@ -23,6 +23,12 @@ typedef struct
 } PortStack;
 
 
+/* GUC variables */
+extern int		node_number;
+extern int		nodes_at_cluster;
+extern char		*pargres_hosts_string;
+extern int		ports_pool_size;
+
 extern PortStack *PORTS;
 extern int CoordinatorNode;
 extern bool PargresInitialized;

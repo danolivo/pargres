@@ -55,9 +55,16 @@ static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 static planner_hook_type			prev_planner_hook = NULL;
 static shmem_startup_hook_type		prev_shmem_startup_hook = NULL;
 
+
 static void HOOK_Parser_injection(ParseState *pstate, Query *query);
 static PlannedStmt *HOOK_Planner_injection(Query *parse, int cursorOptions,
 											ParamListInfo boundParams);
+static void HOOK_Utility_injection(PlannedStmt *pstmt, const char *queryString,
+								   ProcessUtilityContext context,
+								   ParamListInfo params,
+								   QueryEnvironment *queryEnv,
+								   DestReceiver *dest,
+								   char *completionTag);
 
 static void changeAggPlan(Plan *plan, PlannedStmt *stmt, fr_options_t outerFrOpts);
 static fr_options_t changeJoinPlan(Plan *plan, PlannedStmt *stmt,
@@ -138,6 +145,15 @@ set_sequence_options(CreateSeqStmt *seq, int nnum)
 static void
 PLAN_Hooks_init(void)
 {
+	/* ProcessUtility hook */
+	next_ProcessUtility_hook = ProcessUtility_hook;
+	ProcessUtility_hook = HOOK_Utility_injection;
+
+	/* Parser hook */
+	prev_post_parse_analyze_hook = post_parse_analyze_hook;
+	post_parse_analyze_hook = HOOK_Parser_injection;
+
+	/* Planner hook */
 	prev_planner_hook	= planner_hook;
 	planner_hook		= HOOK_Planner_injection;
 }
@@ -366,7 +382,7 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 		break;
 
 	case T_SeqScan:
-		relid = getrelid(((SeqScan *)root)->scanrelid, stmt->rtable);
+		relid = (rt_fetch(((SeqScan *)root)->scanrelid, stmt->rtable)->relid);
 		FrOpts = get_fragmentation(relid);
 		return FrOpts;
 
@@ -580,8 +596,8 @@ changeModifyTablePlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 
 	/* Simple way for prototype only*/
 	Assert(list_length(modify_table->resultRelations) == 1);
-	resultRelationOid = getrelid(linitial_int(stmt->resultRelations),
-																	rangeTable);
+	resultRelationOid = (rt_fetch(linitial_int(stmt->resultRelations),
+						 rangeTable)->relid);
 	Assert(list_length(modify_table->plans) == 1);
 
 	/* Insert EXCHANGE node as a children of INSERT node */
@@ -772,12 +788,29 @@ _PG_init(void)
 							NULL,
 							NULL);
 
-	/* ProcessUtility hook */
-	next_ProcessUtility_hook = ProcessUtility_hook;
-	ProcessUtility_hook = HOOK_Utility_injection;
+	DefineCustomStringVariable("pargres.hosts",
+							   "Nodes network address list",
+							   NULL,
+							   &pargres_hosts_string,
+							   "localhost",
+							   PGC_SIGHUP,
+							   GUC_NOT_IN_SAMPLE,
+							   NULL,
+							   NULL,
+							   NULL);
 
-	prev_post_parse_analyze_hook = post_parse_analyze_hook;
-	post_parse_analyze_hook = HOOK_Parser_injection;
+	DefineCustomIntVariable("pargres.nports",
+								"Number of ports at in exchange pool",
+								NULL,
+								&ports_pool_size,
+								1000,
+								1,
+								10000,
+								PGC_SIGHUP,
+								GUC_NOT_IN_SAMPLE,
+								NULL,
+								NULL,
+								NULL);
 
 	EXCHANGE_Init_methods();
 

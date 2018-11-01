@@ -41,8 +41,6 @@ typedef struct
 } ex_conn_t;
 
 extern ConnInfo	*BackendConnInfo;
-extern int		node_number;
-extern int		nodes_at_cluster;
 extern int		CoordinatorPort;
 extern pgsocket	CoordinatorSock;
 extern pgsocket	ServiceSock[NODES_MAX_NUM];
@@ -52,7 +50,7 @@ extern ConnInfoPool ProcessSharedConnInfoPool;
 extern void CONN_Init_module(void);
 extern void InstanceConnectionsSetup(void);
 extern int ListenPort(int port, pgsocket *sock);
-extern pgsocket CONN_Connect(int port, const char *address);
+extern pgsocket CONN_Connect(int port, in_addr_t host);
 extern int PostmasterConnectionsSetup(void);
 extern int QueryExecutionInitialize(int port);
 extern int CONN_Launch_query(const char *query);

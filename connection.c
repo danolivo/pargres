@@ -10,6 +10,7 @@
 #include "libpq/libpq.h"
 #include "libpq-fe.h"
 #include "utils/memutils.h"
+#include "utils/varlena.h"
 
 #include "common.h"
 #include "connection.h"
@@ -19,18 +20,14 @@
 
 typedef PGconn* ppgconn;
 
-MemoryContext	ParGRES_context;
 
-/*
- * GUC: node_number
- */
-int node_number;
-int nodes_at_cluster;
+MemoryContext	ParGRES_context;
 
 /* Parameters of coordinator for current query */
 int			CoordinatorPort;
 pgsocket	CoordinatorSock = PGINVALID_SOCKET;
-
+in_addr_t	pargres_hosts[NODES_MAX_NUM];
+List		*pargres_host_names = NULL;
 ConnInfoPool ProcessSharedConnInfoPool;
 
 /*
@@ -52,13 +49,44 @@ static int _accept(pgsocket socket, struct sockaddr *addr,
 static int _send(int socket, void *buffer, size_t size, int flags);
 static int _recv(int socket, void *buffer, size_t size, int flags);
 
+#define HOST_NAME(node)	((char *)(list_nth(pargres_host_names, node)))
 
 void
 CONN_Init_module(void)
 {
+	int			node = 0;
+	char		*rawstr;
+	ListCell	*l;
+	MemoryContext	oldCxt;
+
 	ParGRES_context = AllocSetContextCreate(TopMemoryContext,
 												"PargresMemoryContext",
 												ALLOCSET_DEFAULT_SIZES);
+	oldCxt = MemoryContextSwitchTo(ParGRES_context);
+
+	Assert(nodes_at_cluster <= NODES_MAX_NUM);
+
+	/* Now pargres_hosts_string need to be parse into array */
+	rawstr = pstrdup(pargres_hosts_string);
+	if(!SplitIdentifierString(rawstr, ',', &pargres_host_names))
+		elog(ERROR, "Bogus hosts string format: %s", rawstr);
+
+	for ((l) = list_head(pargres_host_names); (l) != NULL; (l) = lnext(l))
+	{
+		char	*address = (char *) lfirst(l);
+		struct hostent* server;
+
+		Assert(node < nodes_at_cluster);
+
+		if ((server = gethostbyname(address)) == NULL)
+			elog(ERROR,"Unknown host: %s\n", address);
+
+//		elog(LOG, "%d: %s", node, HOST_NAME(pargres_host_names, node));
+		pargres_hosts[node] =
+							((struct in_addr *)server->h_addr_list[0])->s_addr;
+		node++;
+	}
+	MemoryContextSwitchTo(oldCxt);
 }
 
 /*
@@ -136,26 +164,26 @@ ListenPort(int port, pgsocket *sock)
 }
 
 pgsocket
-CONN_Connect(int port, const char *address)
+CONN_Connect(int port, in_addr_t host)
 {
 	pgsocket			sock;
 	struct sockaddr_in	addr;
 	int					res;
-	struct hostent		*server;
+//	struct hostent		*server;
 
 
 	sock = socket(AF_INET, SOCK_STREAM, 0);
 	if(sock < 0)
 		perror("ERROR on connect");
 
-	server = gethostbyname(address);
+//	server = gethostbyname(address);
 
-	if (server == NULL)
-		elog(ERROR,"No such host\n");
+//	if (server == NULL)
+//		elog(ERROR,"No such host\n");
 
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(port);
-	addr.sin_addr.s_addr = ((struct in_addr *)server->h_addr_list[0])->s_addr;
+	addr.sin_addr.s_addr = host; //((struct in_addr *)server->h_addr_list[0])->s_addr;
 
 	do
 	{
@@ -205,7 +233,7 @@ PostmasterConnectionsSetup(void)
 	{
 		if ((node != node_number) && (conn[node] == NULL))
 		{
-			sprintf(conninfo, "host=%s port=%d%c", "localhost", 5433+node, '\0');
+			sprintf(conninfo, "host=%s port=%d%c", HOST_NAME(node), 5433+node, '\0');
 			conn[node] = PQconnectdb(conninfo);
 			if (PQstatus(conn[node]) == CONNECTION_BAD)
 			{
@@ -273,7 +301,7 @@ ServiceConnectionSetup(void)
 	}
 	else
 	{
-		CoordinatorSock = CONN_Connect(CoordinatorPort, "localhost");
+		CoordinatorSock = CONN_Connect(CoordinatorPort, pargres_hosts[CoordinatorNode]);
 		Assert(CoordinatorSock > 0);
 		CONN_Send(CoordinatorSock, &node_number, sizeof(int));
 	}
@@ -402,7 +430,7 @@ CONN_Init_exchange(ConnInfo *pool, ex_conn_t *exconn, int mynum, int nnodes)
 	{
 		if (node == node_number)
 			continue;
-		exconn->wsock[node] = CONN_Connect(pool->port[node], "localhost");
+		exconn->wsock[node] = CONN_Connect(pool->port[node], pargres_hosts[node]);
 		Assert(exconn->wsock[node] > 0);
 	}
 
