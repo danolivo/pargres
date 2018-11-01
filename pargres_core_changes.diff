@@ -1,0 +1,40 @@
+diff --git a/contrib/Makefile b/contrib/Makefile
+index 92184ed487..89d5814930 100644
+--- a/contrib/Makefile
++++ b/contrib/Makefile
+@@ -28,6 +28,7 @@ SUBDIRS = \
+ 		ltree		\
+ 		oid2name	\
+ 		pageinspect	\
++		pargres \
+ 		passwordcheck	\
+ 		pg_buffercache	\
+ 		pg_freespacemap \
+diff --git a/src/backend/executor/nodeHashjoin.c b/src/backend/executor/nodeHashjoin.c
+index dd94cffbd1..ef3459766f 100644
+--- a/src/backend/executor/nodeHashjoin.c
++++ b/src/backend/executor/nodeHashjoin.c
+@@ -295,7 +295,10 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
+ 				 * outer relation.
+ 				 */
+ 				if (hashtable->totalTuples == 0 && !HJ_FILL_OUTER(node))
++				{
++					while (!TupIsNull(ExecProcNode(outerNode)));
+ 					return NULL;
++				}
+ 
+ 				/*
+ 				 * need to remember whether nbatch has increased since we
+diff --git a/src/backend/executor/nodeNestloop.c b/src/backend/executor/nodeNestloop.c
+index 9ae9863226..fa14f1c3ae 100644
+--- a/src/backend/executor/nodeNestloop.c
++++ b/src/backend/executor/nodeNestloop.c
+@@ -114,6 +114,8 @@ ExecNestLoop(PlanState *pstate)
+ 			if (TupIsNull(outerTupleSlot))
+ 			{
+ 				ENL1_printf("no outer tuple, ending join");
++				ExecReScan(innerPlan);
++				while (!TupIsNull(ExecProcNode(innerPlan)));
+ 				return NULL;
+ 			}
+ 
