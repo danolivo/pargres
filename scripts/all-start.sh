@@ -9,12 +9,14 @@ pkill -e postgres
 ulimit -c unlimited
 
 hosts="localhost"
+ports="5433"
 for (( node=1; node<$1; node++ ))
 do
 	hosts="$hosts, localhost"
+	ports="$ports, $((5433+node))"
 done
 
-echo "hosts: $hosts"
+echo "hosts: $hosts, ports: $ports"
 
 for (( node=0; node<$1; node++ ))
 do
@@ -30,7 +32,8 @@ do
 	echo "pargres.node = $node" >> $pgdata_dir/postgresql.conf
 	echo "pargres.nnodes = $1" >> $pgdata_dir/postgresql.conf
 	echo "pargres.hosts = '$hosts'" >> $pgdata_dir/postgresql.conf
-	echo "pargres.nports = 1000" >> $pgdata_dir/postgresql.conf
+	echo "pargres.ports = '$ports'" >> $pgdata_dir/postgresql.conf
+	echo "pargres.eports = 1000" >> $pgdata_dir/postgresql.conf
 	
 	echo "parallel_setup_cost = 0.0" >> $pgdata_dir/postgresql.conf
 	echo "parallel_tuple_cost = 0.0" >> $pgdata_dir/postgresql.conf

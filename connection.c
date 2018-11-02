@@ -27,6 +27,7 @@ MemoryContext	ParGRES_context;
 int			CoordinatorPort;
 pgsocket	CoordinatorSock = PGINVALID_SOCKET;
 in_addr_t	pargres_hosts[NODES_MAX_NUM];
+in_addr_t	pargres_ports[NODES_MAX_NUM];
 List		*pargres_host_names = NULL;
 ConnInfoPool ProcessSharedConnInfoPool;
 
@@ -50,6 +51,7 @@ static int _send(int socket, void *buffer, size_t size, int flags);
 static int _recv(int socket, void *buffer, size_t size, int flags);
 
 #define HOST_NAME(node)	((char *)(list_nth(pargres_host_names, node)))
+#define PORT_NUM(node)	(pargres_ports[node])
 
 void
 CONN_Init_module(void)
@@ -58,6 +60,7 @@ CONN_Init_module(void)
 	char		*rawstr;
 	ListCell	*l;
 	MemoryContext	oldCxt;
+	List		*pargres_port_names;
 
 	ParGRES_context = AllocSetContextCreate(TopMemoryContext,
 												"PargresMemoryContext",
@@ -86,6 +89,20 @@ CONN_Init_module(void)
 							((struct in_addr *)server->h_addr_list[0])->s_addr;
 		node++;
 	}
+
+	/* Parse ports numbers to an array */
+	node = 0;
+	rawstr = pstrdup(pargres_ports_string);
+	if(!SplitIdentifierString(rawstr, ',', &pargres_port_names))
+		elog(ERROR, "Bogus ports string format: %s", rawstr);
+
+	for ((l) = list_head(pargres_port_names); (l) != NULL; (l) = lnext(l))
+	{
+		Assert(node < nodes_at_cluster);
+		sscanf((char *) lfirst(l), "%d", &pargres_ports[node]);
+		node++;
+	}
+
 	MemoryContextSwitchTo(oldCxt);
 }
 
@@ -233,7 +250,7 @@ PostmasterConnectionsSetup(void)
 	{
 		if ((node != node_number) && (conn[node] == NULL))
 		{
-			sprintf(conninfo, "host=%s port=%d%c", HOST_NAME(node), 5433+node, '\0');
+			sprintf(conninfo, "host=%s port=%d%c", HOST_NAME(node), PORT_NUM(node), '\0');
 			conn[node] = PQconnectdb(conninfo);
 			if (PQstatus(conn[node]) == CONNECTION_BAD)
 			{

@@ -82,7 +82,7 @@ static fr_options_t getRelFrag(const char *relname);
 static Size
 PortStackShmemSize(void)
 {
-	return sizeof(PortStack);
+	return sizeof(offsetof(PortStack, values) + sizeof(int) * eports_pool_size);
 }
 
 /*
@@ -106,7 +106,7 @@ HOOK_Shmem_injection(void)
 	{
 		/* Initialize shared memory area */
 		Assert(!found);
-		STACK_Init(PORTS, 8000+node_number*MAX_EXCHANGE_PORTS, MAX_EXCHANGE_PORTS);
+		STACK_Init(PORTS, 8000+node_number*eports_pool_size, eports_pool_size);
 	}
 	else
 		Assert(found);
@@ -799,10 +799,21 @@ _PG_init(void)
 							   NULL,
 							   NULL);
 
-	DefineCustomIntVariable("pargres.nports",
+	DefineCustomStringVariable("pargres.ports",
+								   "Nodes network ports list",
+								   NULL,
+								   &pargres_ports_string,
+								   "5432",
+								   PGC_SIGHUP,
+								   GUC_NOT_IN_SAMPLE,
+								   NULL,
+								   NULL,
+								   NULL);
+
+	DefineCustomIntVariable("pargres.eports",
 								"Number of ports at in exchange pool",
 								NULL,
-								&ports_pool_size,
+								&eports_pool_size,
 								1000,
 								1,
 								10000,

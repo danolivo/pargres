@@ -13,7 +13,8 @@
 int node_number;
 int nodes_at_cluster;
 char	*pargres_hosts_string = NULL;
-int		ports_pool_size = 100;
+char	*pargres_ports_string = NULL;
+int		eports_pool_size = 100;
 
 int CoordinatorNode = -1;
 bool PargresInitialized = false;

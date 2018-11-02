@@ -12,14 +12,12 @@
 #include "storage/lock.h"
 
 
-#define MAX_EXCHANGE_PORTS	(2000)
-
 typedef struct
 {
 	LWLock	lock;
 	int 	size;
 	int 	index;
-	int		values[MAX_EXCHANGE_PORTS];
+	int		values[FLEXIBLE_ARRAY_MEMBER];
 } PortStack;
 
 
@@ -27,7 +25,8 @@ typedef struct
 extern int		node_number;
 extern int		nodes_at_cluster;
 extern char		*pargres_hosts_string;
-extern int		ports_pool_size;
+extern char		*pargres_ports_string;
+extern int		eports_pool_size;
 
 extern PortStack *PORTS;
 extern int CoordinatorNode;
