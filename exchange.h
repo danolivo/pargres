@@ -1,7 +1,6 @@
 /*
  * exchange.h
  *
- *  Created on: 3 окт. 2018 г.
  *      Author: andrey
  */
 

@@ -35,7 +35,8 @@ PG_FUNCTION_INFO_V1(isLocalValue);
 void _PG_init(void);
 
 /* This subplan is unfragmented */
-const fr_options_t NO_FRAGMENTATION = {.attno = -1, .funcId = FR_FUNC_NINITIALIZED};
+const fr_options_t NO_FRAGMENTATION = {.attno = -1,
+									   .funcId = FR_FUNC_NINITIALIZED};
 
 typedef struct
 {
@@ -66,7 +67,8 @@ static void HOOK_Utility_injection(PlannedStmt *pstmt, const char *queryString,
 								   DestReceiver *dest,
 								   char *completionTag);
 
-static void changeAggPlan(Plan *plan, PlannedStmt *stmt, fr_options_t outerFrOpts);
+static void changeAggPlan(Plan *plan, PlannedStmt *stmt,
+						  fr_options_t outerFrOpts);
 static fr_options_t changeJoinPlan(Plan *plan, PlannedStmt *stmt,
 						   fr_options_t innerFrOpts,
 						   fr_options_t outerFrOpts);
@@ -111,36 +113,6 @@ HOOK_Shmem_injection(void)
 	else
 		Assert(found);
 }
-
-/*
-static void
-set_sequence_options(CreateSeqStmt *seq, int nnum)
-{
-	ListCell	*option;
-	int64		base;
-
-	base = nnum*PG_INT32_MAX/NODES_MAX_NUM;
-
-	foreach(option, seq->options)
-	{
-		DefElem    *defel = (DefElem *) lfirst(option);
-
-		if (strcmp(defel->defname, "start") == 0)
-			elog(ERROR, "Sequence: start can't be used");
-		else if (strcmp(defel->defname, "minvalue") == 0)
-			elog(ERROR, "Sequence: minvalue can't be used");
-		else if (strcmp(defel->defname, "maxvalue") == 0)
-			elog(ERROR, "Sequence: maxvalue can't be used");
-	}
-
-	seq->options = lappend(seq->options,
-						  makeDefElem("maxvalue", (Node *) makeFloat(psprintf(INT64_FORMAT, base + PG_INT32_MAX/NODES_MAX_NUM - 1)), -1));
-	seq->options = lappend(seq->options,
-						  makeDefElem("minvalue", (Node *) makeFloat(psprintf(INT64_FORMAT, base)), -1));
-	seq->options = lappend(seq->options,
-						  makeDefElem("start", (Node *) makeFloat(psprintf(INT64_FORMAT, base)), -1));
-}
-*/
 
 static void
 PLAN_Hooks_init(void)
@@ -238,8 +210,6 @@ static int outer_join_attr;
 static void
 traverse_qual_list(Expr *node, int inner_attno, int outer_attno, int rec)
 {
-//	elog(INFO, "[%d] type=%d", rec, node->type);
-
 	switch (nodeTag(node))
 	{
 		case T_Var:
@@ -255,17 +225,13 @@ traverse_qual_list(Expr *node, int inner_attno, int outer_attno, int rec)
 				break;
 			}
 			else if (variable->varno == INNER_VAR)
-			{
-//					elog(INFO, "INNER: variable->varattno = %d", variable->varattno);
 					inner_join_attr = (inner_join_attr == 0) ?
 										variable->varattno : -1;
-			}
+
 			else if (variable->varno == OUTER_VAR)
-			{
-//					elog(INFO, "OUTER: variable->varattno = %d", variable->varattno);
 					outer_join_attr = (outer_join_attr == 0) ?
 										variable->varattno : -1;
-			}
+
 			else
 				/* Now we can't support INDEX_VAR option */
 				Assert(0);
@@ -408,12 +374,9 @@ traverse_tree(Plan *root, PlannedStmt *stmt)
 		return changeJoinPlan(root, stmt, innerFrOpts, outerFrOpts);
 	}
 	default:
-		if (!isNullFragmentation(&innerFrOpts) && !isNullFragmentation(&outerFrOpts))
-		{
-			if (!isEqualFragmentation(&innerFrOpts, &outerFrOpts))
-				elog(LOG, "!isEqualFragmentation: tag=%d (%d %d) (%d %d) %u", nodeTag(root), innerFrOpts.attno, innerFrOpts.funcId, outerFrOpts.attno, outerFrOpts.funcId, isNullFragmentation(&innerFrOpts));
+		if (!isNullFragmentation(&innerFrOpts) &&
+			!isNullFragmentation(&outerFrOpts))
 			Assert(isEqualFragmentation(&innerFrOpts, &outerFrOpts));
-		}
 		if (!isNullFragmentation(&innerFrOpts))
 			return innerFrOpts;
 		if (!isNullFragmentation(&outerFrOpts))
@@ -433,7 +396,6 @@ attnum_after_join(List *targetlist, int attnum, int isInner)
 	Assert(targetlist != NULL);
 	Assert(attnum > 0);
 
-//	elog(INFO, "JOIN targetlist size: %d", list_length(targetlist));
 	for ((lc) = list_head(targetlist); (lc) != NULL; (lc) = lnext(lc))
 	{
 		TargetEntry	*entry = (TargetEntry *) lfirst(lc);
@@ -446,7 +408,7 @@ attnum_after_join(List *targetlist, int attnum, int isInner)
 		if (nodeTag(arg) == T_Var)
 		{
 			Var *variable = (Var *) arg;
-//			elog(INFO, "arg exists %d isinner=%hhu (%d new=%d att=%d old=%d)", nodeTag(arg), isInner, variable->varno, variable->varattno, attnum,  variable->varoattno);
+
 			if ((((isInner) && (variable->varno == INNER_VAR)) ||
 				((!isInner) && (variable->varno == OUTER_VAR))) &&
 				(variable->varattno == attnum))
@@ -460,7 +422,8 @@ attnum_after_join(List *targetlist, int attnum, int isInner)
  * Locate new position of distribution attribute in result set of JOINed tuples
  */
 static fr_options_t
-get_new_frfn(List *targetlist, fr_options_t *innerFrOpts, fr_options_t *outerFrOpts)
+get_new_frfn(List *targetlist, fr_options_t *innerFrOpts,
+			 fr_options_t *outerFrOpts)
 {
 	int new_attnum = 0;
 
@@ -498,7 +461,8 @@ changeAggPlan(Plan *plan, PlannedStmt *stmt, fr_options_t outerFrOpts)
 	if (!DO_AGGSPLIT_SKIPFINAL(agg->aggsplit))
 	{
 		Assert(plan->righttree == NULL);
-		plan->lefttree = make_exchange(plan->lefttree, outerFrOpts, false, true, node_number, nodes_at_cluster);
+		plan->lefttree = make_exchange(plan->lefttree, outerFrOpts, false, true,
+									   node_number, nodes_at_cluster);
 	}
 }
 
@@ -508,7 +472,8 @@ changeJoinPlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 {
 	Plan	**InnerPlan;
 
-	if (isEqualFragmentation(&innerFrOpts, &NO_FRAGMENTATION) || isEqualFragmentation(&outerFrOpts, &NO_FRAGMENTATION))
+	if (isEqualFragmentation(&innerFrOpts, &NO_FRAGMENTATION) ||
+		isEqualFragmentation(&outerFrOpts, &NO_FRAGMENTATION))
 		/* Join with system relation. Made it locally */
 		return NO_FRAGMENTATION;
 
@@ -538,7 +503,8 @@ changeJoinPlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 			outerFrOpts.attno = outer_join_attr;
 			outerFrOpts.funcId = innerFrOpts.funcId;
 			outerPlan(plan) = make_exchange(outerPlan(plan), outerFrOpts, false,
-											false, node_number, nodes_at_cluster);
+											false, node_number,
+											nodes_at_cluster);
 
 			return get_new_frfn(plan->targetlist, &innerFrOpts, &outerFrOpts);
 		}
@@ -561,11 +527,12 @@ changeJoinPlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 				 * Inner and outer relations distributed by its fragmentation
 				 * attributes.
 				 */
-				return get_new_frfn(plan->targetlist, &innerFrOpts, &outerFrOpts);
+				return get_new_frfn(plan->targetlist, &innerFrOpts,
+									&outerFrOpts);
 
 			innerFrOpts.funcId = outerFrOpts.funcId;
 			*InnerPlan = make_exchange(*InnerPlan, innerFrOpts, false,
-											false, node_number, nodes_at_cluster);
+									   false, node_number, nodes_at_cluster);
 
 			return get_new_frfn(plan->targetlist, &innerFrOpts, &outerFrOpts);
 		}
@@ -591,7 +558,8 @@ changeModifyTablePlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 	int			nodetag = nodeTag(linitial(modify_table->plans));
 
 	/* Skip if not ModifyTable with 'INSERT' command */
-	if (!IsA(modify_table, ModifyTable) || modify_table->operation != CMD_INSERT)
+	if (!IsA(modify_table, ModifyTable) ||
+		modify_table->operation != CMD_INSERT)
 		return;
 
 	/* Simple way for prototype only*/
@@ -602,39 +570,19 @@ changeModifyTablePlan(Plan *plan, PlannedStmt *stmt, fr_options_t innerFrOpts,
 
 	/* Insert EXCHANGE node as a children of INSERT node */
 	if ((nodetag == T_Result) || (nodetag == T_ValuesScan))
-		linitial(modify_table->plans) = make_exchange(linitial(modify_table->plans),
-			get_fragmentation(resultRelationOid), true, false, node_number, nodes_at_cluster);
-	else {
-//		elog(LOG, "Seq Scan INSERT subplan");
-		linitial(modify_table->plans) = make_exchange(linitial(modify_table->plans),
-					get_fragmentation(resultRelationOid), false, false, node_number, nodes_at_cluster);
-	}
+		linitial(modify_table->plans) = make_exchange(
+											linitial(modify_table->plans),
+											get_fragmentation(resultRelationOid),
+											true, false, node_number,
+											nodes_at_cluster);
+	else
+		linitial(modify_table->plans) = make_exchange(
+											linitial(modify_table->plans),
+											get_fragmentation(resultRelationOid),
+											false, false, node_number,
+											nodes_at_cluster);
 }
 /*
-static void
-Do_Refragment_relation(const char *relname)
-{
-	PGconn		*conn;
-	PGresult	*result;
-	char		conninfo[STRING_SIZE_MAX];
-	char		command[STRING_SIZE_MAX];
-
-	sprintf(conninfo, "host=%s port=%d%c", "localhost", 5433, '\0');
-	conn = PQconnectdb(conninfo);
-	Assert(PQstatus(conn) != CONNECTION_BAD);
-
-	sprintf(command,
-	"INSERT INTO pgbench_accounts (SELECT * FROM %s) ON CONFLICT DO NOTHING;%c",
-																relname, '\0');
-	result = PQexec(conn, command);
-	Assert(PQresultStatus(result) != PGRES_FATAL_ERROR);
-
-	sprintf(command,
-	"DELETE FROM %s WHERE isLocalValue('%s', aid) = false;%c",
-														relname, relname, '\0');
-	result = PQexec(conn, command);
-	Assert(PQresultStatus(result) != PGRES_FATAL_ERROR);
-}
 */
 /*
  * HOOK_Utility_injection
@@ -656,9 +604,6 @@ HOOK_Utility_injection(PlannedStmt *pstmt,
 
 	switch (nodeTag(parsetree))
 	{
-	case T_CreateSeqStmt: /* CREATE SEQUENCE */
-//		set_sequence_options((CreateSeqStmt *) parsetree, node_number);
-		break;
 	case T_CreateStmt: /* CREATE TABLE */
 		create_table_frag(((CreateStmt *)parsetree)->relation->relname, 1,
 						  FR_FUNC_DEFAULT);
@@ -668,8 +613,8 @@ HOOK_Utility_injection(PlannedStmt *pstmt,
 	}
 
 	if (next_ProcessUtility_hook)
-		(*next_ProcessUtility_hook) (pstmt, queryString, context, params, queryEnv,
-								 	 dest, completionTag);
+		(*next_ProcessUtility_hook) (pstmt, queryString, context, params,
+									 queryEnv, dest, completionTag);
 	else
 		standard_ProcessUtility(pstmt, queryString,
 											context, params, queryEnv,
@@ -686,7 +631,8 @@ HOOK_Parser_injection(ParseState *pstate, Query *query)
 	if (prev_post_parse_analyze_hook)
 		prev_post_parse_analyze_hook(pstate, query);
 
-	if ((query->commandType == CMD_UTILITY) && (nodeTag(query->utilityStmt) == T_CopyStmt))
+	if ((query->commandType == CMD_UTILITY) &&
+		(nodeTag(query->utilityStmt) == T_CopyStmt))
 		return;
 
 	/* Extension is not initialized. */
@@ -701,10 +647,10 @@ HOOK_Parser_injection(ParseState *pstate, Query *query)
 		return;
 	}
 
-	if (CoordinatorNode < 0)
+	if (CoordNode < 0)
 	{
 		/* Executed only by coordinator at first query in a session. */
-		CoordinatorNode = node_number;
+		CoordNode = node_number;
 
 		/* Establish connections to all another instances. */
 		InstanceConnectionsSetup();
@@ -714,12 +660,13 @@ HOOK_Parser_injection(ParseState *pstate, Query *query)
 	 * Send Query to another instances. Ideally, we must send a plan of the
 	 * query.
 	 */
-	if (CoordinatorNode == node_number)
+	if (CoordNode == node_number)
 		CONN_Launch_query(pstate->p_sourcetext);
 }
 
 PlannedStmt *
-HOOK_Planner_injection(Query *parse, int cursorOptions, ParamListInfo boundParams)
+HOOK_Planner_injection(Query *parse, int cursorOptions,
+					   ParamListInfo boundParams)
 {
 	PlannedStmt 	*stmt;
 	Plan			*root;
@@ -745,11 +692,10 @@ HOOK_Planner_injection(Query *parse, int cursorOptions, ParamListInfo boundParam
 	{
 		/*
 		 * Aggregate node generate same value at each parallel plan by
-		 * a exchange broadcasting in lefttree node. Now, We do not need to shuffle
-		 * the data.
+		 * a exchange broadcasting in lefttree node. Now, We do not need
+		 * to shuffle the data.
 		 */
-		Assert(CoordinatorNode >= 0);
-//		Assert(innerPlan(stmt->planTree) == NULL);
+		Assert(CoordNode >= 0);
 		stmt->planTree = make_exchange(stmt->planTree,
 				frOpts, false, false, node_number, nodes_at_cluster);
 	}
@@ -904,10 +850,6 @@ load_description_frag(void)
 		strcpy(frRelations[nfrRelations].relname, TextDatumGetCString(values[0]));
 		frRelations[nfrRelations].frOpts.attno = DatumGetInt32(values[1]);
 		frRelations[nfrRelations].frOpts.funcId = DatumGetInt32(values[2]);
-//		elog(LOG, "[%d] relname: %s attno: %d funcId: %d", nfrRelations,
-//						frRelations[nfrRelations].relname,
-//						frRelations[nfrRelations].frOpts.attno,
-//						frRelations[nfrRelations].frOpts.funcId);
 		nfrRelations++;
 	}
 
@@ -920,15 +862,15 @@ set_query_id(PG_FUNCTION_ARGS)
 {
 //	int res;
 
-	CoordinatorNode = PG_GETARG_INT32(0);
+	CoordNode = PG_GETARG_INT32(0);
 	CoordinatorPort = 	PG_GETARG_INT32(1);
 
-	Assert((CoordinatorNode >=0) && (CoordinatorNode < nodes_at_cluster));
+	Assert((CoordNode >=0) && (CoordNode < nodes_at_cluster));
 	Assert((CoordinatorPort > 0) && (CoordinatorPort < PG_UINT16_MAX));
 
 	ServiceConnectionSetup();
 
-	Assert(CoordinatorSock > 0);
+	Assert(CoordSock > 0);
 	PG_RETURN_VOID();
 }
 
@@ -940,7 +882,7 @@ isLocalValue(PG_FUNCTION_ARGS)
 	bool			result;
 	fr_options_t	frOpts;
 	fragmentation_fn_t	func;
-//elog(LOG, "isLocalValue: %s, %d", relname, value);
+
 	if (nfrRelations == 0)
 		load_description_frag();
 	if (nfrRelations == 0)

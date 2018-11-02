@@ -49,7 +49,7 @@ HOOK_ExecEnd_injection(QueryDesc *queryDesc)
 	{
 		OnExecutionEnd();
 
-		if (CoordinatorNode == node_number)
+		if (CoordNode == node_number)
 			CONN_Check_query_result();
 	}
 

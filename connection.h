@@ -1,7 +1,6 @@
 /*
  * connection.h
  *
- *  Created on: 8 окт. 2018 г.
  *      Author: andrey
  */
 
@@ -42,7 +41,7 @@ typedef struct
 
 extern ConnInfo	*BackendConnInfo;
 extern int		CoordinatorPort;
-extern pgsocket	CoordinatorSock;
+extern pgsocket	CoordSock;
 extern pgsocket	ServiceSock[NODES_MAX_NUM];
 extern ConnInfoPool ProcessSharedConnInfoPool;
 
@@ -60,7 +59,7 @@ extern void CONN_Init_exchange(ConnInfo *pool, ex_conn_t *exconn, int mynum,
 extern void CONN_Exchange_close(ex_conn_t *conn);
 extern int CONN_Send(pgsocket sock, void *buf, int size);
 extern int CONN_Recv(pgsocket *socks, int nsocks, void *buf, int expected_size);
-extern HeapTuple CONN_Recv_any(pgsocket *socks, bool *isopened, int *res);
+extern HeapTuple CONN_Recv_tuple(pgsocket *socks, bool *isopened, int *res);
 extern void ServiceConnectionSetup(void);
 extern void OnExecutionEnd(void);
 extern ConnInfo* GetConnInfo(ConnInfoPool *pool);

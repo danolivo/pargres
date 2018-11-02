@@ -16,8 +16,9 @@ static void EXCHANGE_Begin(CustomScanState *node, EState *estate, int eflags);
 static TupleTableSlot *EXCHANGE_Execute(CustomScanState *node);
 static void EXCHANGE_End(CustomScanState *node);
 static void EXCHANGE_Rescan(CustomScanState *node);
-static void EXCHANGE_ReInitializeDSM(CustomScanState *node, ParallelContext *pcxt,
-		  	  	  	  	 void *coordinate);
+static void EXCHANGE_ReInitializeDSM(CustomScanState *node,
+									 ParallelContext *pcxt,
+									 void *coordinate);
 static void EXCHANGE_Explain(CustomScanState *node, List *ancestors,
 							 ExplainState *es);
 static Size EXCHANGE_EstimateDSM(CustomScanState *node, ParallelContext *pcxt);
@@ -105,7 +106,8 @@ EXCHANGE_Begin(CustomScanState *node, EState *estate, int eflags)
 	ExchangeState	*state = (ExchangeState *) node;
 	TupleDesc		tupDesc;
 
-	outerPlanState(node) = ExecInitNode(outerPlan(node->ss.ps.plan), estate, eflags);
+	outerPlanState(node) = ExecInitNode(outerPlan(node->ss.ps.plan), estate,
+																		eflags);
 
 	Assert(innerPlan(node->ss.ps.plan) == NULL);
 
@@ -138,22 +140,25 @@ EXCHANGE_Begin(CustomScanState *node, EState *estate, int eflags)
 			 * ExecParallelInitializeDSM () function earlier.
 			 */
 			state->connPool = palloc(sizeof(ConnInfoPool));
-			CreateConnectionPool(state->connPool, 1, state->nnodes, state->mynode);
+			CreateConnectionPool(state->connPool, 1, state->nnodes,
+																state->mynode);
 		}
 		BackendConnInfo = GetConnInfo(state->connPool);
 	}
 
-	CONN_Init_exchange(BackendConnInfo , &state->conn, state->mynode, state->nnodes);
+	CONN_Init_exchange(BackendConnInfo , &state->conn, state->mynode,
+																state->nnodes);
 }
 
 static TupleTableSlot *
-GetTupleFromNetwork(ExchangeState *state, TupleTableSlot *slot, bool *NetworkIsActive)
+GetTupleFromNetwork(ExchangeState *state, TupleTableSlot *slot,
+					bool *NetworkIsActive)
 {
 	int res;
 	HeapTuple tuple;
 
 	Assert(state->conn.rsock > 0);
-	tuple = CONN_Recv_any(state->conn.rsock, state->conn.rsIsOpened, &res);
+	tuple = CONN_Recv_tuple(state->conn.rsock, state->conn.rsIsOpened, &res);
 
 	if (res < 0)
 	{
@@ -188,7 +193,8 @@ EXCHANGE_Execute(CustomScanState *node)
 
 		if (state->NetworkIsActive)
 		{
-			slot = GetTupleFromNetwork(state, node->ss.ss_ScanTupleSlot, &state->NetworkIsActive);
+			slot = GetTupleFromNetwork(state, node->ss.ss_ScanTupleSlot,
+									   &state->NetworkIsActive);
 
 			if (!TupIsNull(slot))
 			{
@@ -238,7 +244,8 @@ EXCHANGE_Execute(CustomScanState *node)
 					continue;
 
 				CONN_Send(state->conn.wsock[destnode], slot->tts_tuple, tupsize);
-				CONN_Send(state->conn.wsock[destnode], slot->tts_tuple->t_data, slot->tts_tuple->t_len);
+				CONN_Send(state->conn.wsock[destnode], slot->tts_tuple->t_data,
+						  slot->tts_tuple->t_len);
 			}
 
 			/* Send tuple to myself */
@@ -246,7 +253,7 @@ EXCHANGE_Execute(CustomScanState *node)
 		}
 		else if (state->frOpts.funcId == FR_FUNC_GATHER)
 		{
-			destnode = CoordinatorNode;
+			destnode = CoordNode;
 		}
 		else
 		{
@@ -270,7 +277,8 @@ EXCHANGE_Execute(CustomScanState *node)
 
 			Assert(state->conn.wsock[destnode] > 0);
 			CONN_Send(state->conn.wsock[destnode], slot->tts_tuple, tupsize);
-			CONN_Send(state->conn.wsock[destnode], slot->tts_tuple->t_data, slot->tts_tuple->t_len);
+			CONN_Send(state->conn.wsock[destnode], slot->tts_tuple->t_data,
+					  slot->tts_tuple->t_len);
 			continue;
 		}
 	}
@@ -356,8 +364,8 @@ EXCHANGE_Explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	CustomScan			*cscan = (CustomScan *) node->ss.ps.plan;
 	int					nnodes = intVal(list_nth(cscan->custom_private, 0));
 	int					mynode = intVal(list_nth(cscan->custom_private, 1));
-	bool				broadcast_mode = intVal(list_nth(cscan->custom_private, 2));
-	bool				drop_duplicates = intVal(list_nth(cscan->custom_private, 3));
+	bool				bcast_mode = intVal(list_nth(cscan->custom_private, 2));
+	bool				ddrop = intVal(list_nth(cscan->custom_private, 3));
 	fr_options_t		frOpts;
 	StringInfoData		str;
 
@@ -365,12 +373,13 @@ EXCHANGE_Explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	frOpts.funcId = intVal(list_nth(cscan->custom_private, 5));
 	initStringInfo(&str);
 
-	appendStringInfo(&str, "attno: %d, funcId: %d, mynode=%d, nnodes=%d, Drop duplicates: %u, bcast: %u",
+	appendStringInfo(&str,
+					 "attno: %d, fid: %d, nnum=%d, nn=%d, ddrop: %u, bcast: %u",
 					 frOpts.attno,
 					 frOpts.funcId,
 					 mynode,
 					 nnodes,
-					 drop_duplicates, broadcast_mode);
+					 ddrop, bcast_mode);
 
 	ExplainPropertyText("Exchange node", str.data, es);
 }
@@ -408,7 +417,6 @@ make_exchange(Plan *subplan, fr_options_t frOpts,
 
 	/* Setup methods and child plan */
 	node->methods = &exchange_plan_methods;
-//	node->custom_plans = list_make1(subplan);
 	node->custom_scan_tlist = NIL;
 	node->scan.scanrelid = 0;
 	node->custom_plans = NIL;
@@ -429,7 +437,6 @@ make_exchange(Plan *subplan, fr_options_t frOpts,
 static int
 fragmentation_fn_default(int value, int mynum, int nnodes)
 {
-//	elog(LOG, "value: %d nnodes: %d", value, nnodes);
 	return value%nnodes;
 }
 
@@ -437,9 +444,9 @@ static int
 fragmentation_fn_gather(int value, int nodenum, int nnodes)
 {
 	Assert((nodenum >= 0) && (nodenum < nnodes));
-	Assert(CoordinatorNode >= 0);
+	Assert(CoordNode >= 0);
 
-	return CoordinatorNode;
+	return CoordNode;
 }
 
 static int
@@ -482,7 +489,8 @@ EXCHANGE_InitializeDSM(CustomScanState *node, ParallelContext *pcxt,
 	 * EstimateDSMCustomScan() function.
 	 */
 	if (ProcessSharedConnInfoPool.size < 0)
-		CreateConnectionPool(&ProcessSharedConnInfoPool, pcxt->nworkers, nodes_at_cluster, node_number);
+		CreateConnectionPool(&ProcessSharedConnInfoPool, pcxt->nworkers,
+							 nodes_at_cluster, node_number);
 
 	memcpy(coordinate, &ProcessSharedConnInfoPool, sizeof(ConnInfoPool));
 }
@@ -495,7 +503,7 @@ EXCHANGE_InitializeWorker(CustomScanState *node,
 	ExchangeState	*state = (ExchangeState *) node;
 
 	state->connPool = (ConnInfoPool *) coordinate;
-	CoordinatorNode = state->connPool->CoordinatorNode;
+	CoordNode = state->connPool->CoordinatorNode;
 	PargresInitialized = true;
 
 	Assert(!state->conn.rsock);
@@ -504,6 +512,6 @@ EXCHANGE_InitializeWorker(CustomScanState *node,
 	if (!BackendConnInfo)
 		BackendConnInfo = GetConnInfo(state->connPool);
 
-	elog(LOG, "EXCHANGE_InitializeWorker: mynode=%d nnodes=%d", state->mynode, state->nnodes);
-	CONN_Init_exchange(BackendConnInfo , &state->conn, state->mynode, state->nnodes);
+	CONN_Init_exchange(BackendConnInfo , &state->conn, state->mynode,
+																state->nnodes);
 }

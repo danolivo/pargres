@@ -1,7 +1,6 @@
 /*
  * common.h
  *
- *  Created on: 9 окт. 2018 г.
  *      Author: andrey
  */
 
@@ -29,7 +28,7 @@ extern char		*pargres_ports_string;
 extern int		eports_pool_size;
 
 extern PortStack *PORTS;
-extern int CoordinatorNode;
+extern int CoordNode;
 extern bool PargresInitialized;
 
 

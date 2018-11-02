@@ -25,7 +25,7 @@ MemoryContext	ParGRES_context;
 
 /* Parameters of coordinator for current query */
 int			CoordinatorPort;
-pgsocket	CoordinatorSock = PGINVALID_SOCKET;
+pgsocket	CoordSock = PGINVALID_SOCKET;
 in_addr_t	pargres_hosts[NODES_MAX_NUM];
 in_addr_t	pargres_ports[NODES_MAX_NUM];
 List		*pargres_host_names = NULL;
@@ -84,7 +84,6 @@ CONN_Init_module(void)
 		if ((server = gethostbyname(address)) == NULL)
 			elog(ERROR,"Unknown host: %s\n", address);
 
-//		elog(LOG, "%d: %s", node, HOST_NAME(pargres_host_names, node));
 		pargres_hosts[node] =
 							((struct in_addr *)server->h_addr_list[0])->s_addr;
 		node++;
@@ -135,7 +134,8 @@ ListenPort(int port, pgsocket *sock)
 		if (*sock < 0)
 			perror("Error on socket creation");
 
-		if(setsockopt(*sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0)
+		if(setsockopt(*sock, SOL_SOCKET, SO_REUSEADDR, &optval,
+															sizeof(optval)) < 0)
 		    perror("Reusing ADDR failed");
 
 		for (;;)
@@ -193,14 +193,9 @@ CONN_Connect(int port, in_addr_t host)
 	if(sock < 0)
 		perror("ERROR on connect");
 
-//	server = gethostbyname(address);
-
-//	if (server == NULL)
-//		elog(ERROR,"No such host\n");
-
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(port);
-	addr.sin_addr.s_addr = host; //((struct in_addr *)server->h_addr_list[0])->s_addr;
+	addr.sin_addr.s_addr = host;
 
 	do
 	{
@@ -242,7 +237,8 @@ PostmasterConnectionsSetup(void)
 
 	if (!conn)
 		/* Also, which set conn[node] to NULL value*/
-		conn = MemoryContextAllocZero(ParGRES_context, sizeof(ppgconn)*nodes_at_cluster);
+		conn = MemoryContextAllocZero(ParGRES_context,
+											sizeof(ppgconn)*nodes_at_cluster);
 
 	Assert(conn[node_number] == NULL);
 
@@ -250,15 +246,14 @@ PostmasterConnectionsSetup(void)
 	{
 		if ((node != node_number) && (conn[node] == NULL))
 		{
-			sprintf(conninfo, "host=%s port=%d%c", HOST_NAME(node), PORT_NUM(node), '\0');
+			sprintf(conninfo, "host=%s port=%d%c", HOST_NAME(node),
+														PORT_NUM(node), '\0');
 			conn[node] = PQconnectdb(conninfo);
 			if (PQstatus(conn[node]) == CONNECTION_BAD)
 			{
 				elog(LOG, "Connection error. conninfo: %s", conninfo);
 				return -1;
 			}
-			else
-				elog(LOG, "Connection established!: conninfo=%s, status=%d", conninfo, PQstatus(conn[node]));
 		}
 	}
 	return 0;
@@ -296,31 +291,31 @@ accept_connections(pgsocket sock, int cnum, pgsocket *incoming_socks)
 void
 ServiceConnectionSetup(void)
 {
-	if (CoordinatorNode == node_number)
+	if (CoordNode == node_number)
 	{
-		pgsocket	*incoming_socks = palloc((nodes_at_cluster-1)*sizeof(pgsocket));
+		pgsocket	*isocks = palloc((nodes_at_cluster-1)*sizeof(pgsocket));
 		int			i;
 
-		accept_connections(ServiceSock[node_number], nodes_at_cluster-1, incoming_socks);
+		accept_connections(ServiceSock[node_number], nodes_at_cluster-1, isocks);
 		for (i = 0; i < nodes_at_cluster-1; i++)
 		{
 			int nodenum;
 
-			CONN_Recv(incoming_socks, nodes_at_cluster-1, &nodenum, sizeof(int));
+			CONN_Recv(isocks, nodes_at_cluster-1, &nodenum, sizeof(int));
 			Assert(nodenum != node_number);
-			ServiceSock[nodenum] = incoming_socks[i];
+			ServiceSock[nodenum] = isocks[i];
 		}
 
-		pfree(incoming_socks);
+		pfree(isocks);
 
-		CoordinatorSock = PGINVALID_SOCKET;
+		CoordSock = PGINVALID_SOCKET;
 		CoordinatorPort = -1;
 	}
 	else
 	{
-		CoordinatorSock = CONN_Connect(CoordinatorPort, pargres_hosts[CoordinatorNode]);
-		Assert(CoordinatorSock > 0);
-		CONN_Send(CoordinatorSock, &node_number, sizeof(int));
+		CoordSock = CONN_Connect(CoordinatorPort, pargres_hosts[CoordNode]);
+		Assert(CoordSock > 0);
+		CONN_Send(CoordSock, &node_number, sizeof(int));
 	}
 }
 
@@ -484,7 +479,8 @@ OnExecutionEnd(void)
 			perror("CLOSE");
 		BackendExchangeListenSock = PGINVALID_SOCKET;
 
-		Assert((BackendConnInfo->port[node_number] > 0) && (BackendConnInfo->port[node_number] < PG_UINT16_MAX));
+		Assert((BackendConnInfo->port[node_number] > 0) &&
+			   (BackendConnInfo->port[node_number] < PG_UINT16_MAX));
 		STACK_Push(PORTS, BackendConnInfo->port[node_number]);
 		BackendConnInfo = NULL;
 	}
@@ -607,14 +603,20 @@ CONN_Recv(pgsocket *socks, int nsocks, void *buf, int expected_size)
 	return _recv(socks[i], buf, expected_size, 0);
 }
 
+/*
+ * Receive a tuple from any other EXCHANGE instances. One byte length message is
+ * a "End of Tuples" command.
+ * This function returns iff message was arrived.
+ */
 HeapTuple
-CONN_Recv_any(pgsocket *socks, bool *isopened,  int *res)
+CONN_Recv_tuple(pgsocket *socks, bool *isopened,  int *res)
 {
 	int				i;
 	struct timeval	timeout;
 	HeapTupleData	htHeader;
 	HeapTuple		tuple;
-	fd_set readset;
+	fd_set			readset;
+	int				counter = 0;
 
 	Assert(socks != NULL);
 	Assert(isopened != NULL);
@@ -673,7 +675,8 @@ CONN_Recv_any(pgsocket *socks, bool *isopened,  int *res)
 
 			if (FD_ISSET(socks[i], &readset))
 			{
-				if ((*res = _recv(socks[i], &htHeader, offsetof(HeapTupleData, t_data), 0)) > 1)
+				if ((*res = _recv(socks[i], &htHeader,
+								  offsetof(HeapTupleData, t_data), 0)) > 1)
 				{
 					int res1;
 
@@ -686,7 +689,8 @@ CONN_Recv_any(pgsocket *socks, bool *isopened,  int *res)
 
 					tuple = (HeapTuple) palloc0(HEAPTUPLESIZE + htHeader.t_len);
 					memcpy(tuple, &htHeader, HEAPTUPLESIZE);
-					tuple->t_data = (HeapTupleHeader) ((char *) tuple + HEAPTUPLESIZE);
+					tuple->t_data = (HeapTupleHeader)
+											((char *) tuple + HEAPTUPLESIZE);
 					res1 = _recv(socks[i], tuple->t_data, tuple->t_len, 0);
 					Assert(res1 == tuple->t_len);
 					*res += res1;
@@ -699,16 +703,16 @@ CONN_Recv_any(pgsocket *socks, bool *isopened,  int *res)
 					continue;
 				}
 				else if (*res < 0)
-				{
-					elog(LOG, "Receive problems at connection %d (sock %d)", i, socks[i]);
 					perror("RECEIVE ERROR");
-				}
 				else
 					Assert(0);
 			}
 		}
+		pg_usleep(1);
+		if (++counter >= 1000000)
+			elog(ERROR, "Exchange receiving timeout was exceeded.");
 	}
-	Assert(0);
+
 	return NULL;
 }
 
@@ -738,24 +742,26 @@ CreateConnectionPool(ConnInfoPool *pool, int nconns, int nnodes, int mynode)
 	Assert(nnodes > 0);
 	Assert((mynode >= 0) && (mynode < nnodes));
 
-	pool->CoordinatorNode = CoordinatorNode;
+	pool->CoordinatorNode = CoordNode;
 
 	for (i = 0; i < nconns; i++)
 	{
 		int j;
 
-		if (mynode == CoordinatorNode)
+		if (mynode == CoordNode)
 		{
 			pool->info[i].port[mynode] = STACK_Pop(PORTS);
 
-			Assert((pool->info[i].port[mynode] > 0) && (pool->info[i].port[mynode] < PG_UINT16_MAX));
+			Assert((pool->info[i].port[mynode] > 0) &&
+				   (pool->info[i].port[mynode] < PG_UINT16_MAX));
 
 			for (j = 0; j < nnodes; j++)
 			{
 				if (j == mynode)
 					continue;
 
-				CONN_Recv(&ServiceSock[j], 1, &(pool->info[i].port[j]), sizeof(int));
+				CONN_Recv(&ServiceSock[j], 1, &(pool->info[i].port[j]),
+																sizeof(int));
 			}
 
 			for (j = 0; j < nnodes; j++)
@@ -771,10 +777,10 @@ CreateConnectionPool(ConnInfoPool *pool, int nconns, int nnodes, int mynode)
 			int port = STACK_Pop(PORTS);
 
 			Assert((port > 0) && (port < PG_UINT16_MAX));
-			Assert(CoordinatorSock > 0);
+			Assert(CoordSock > 0);
 
-			CONN_Send(CoordinatorSock, &port, sizeof(int));
-			CONN_Recv(&CoordinatorSock, 1, pool->info[i].port, nnodes*sizeof(int));
+			CONN_Send(CoordSock, &port, sizeof(int));
+			CONN_Recv(&CoordSock, 1, pool->info[i].port, nnodes*sizeof(int));
 		}
 	}
 	pg_atomic_write_u32(&pool->current, 0);

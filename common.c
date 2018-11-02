@@ -16,7 +16,7 @@ char	*pargres_hosts_string = NULL;
 char	*pargres_ports_string = NULL;
 int		eports_pool_size = 100;
 
-int CoordinatorNode = -1;
+int CoordNode = -1;
 bool PargresInitialized = false;
 PortStack *PORTS;
 
