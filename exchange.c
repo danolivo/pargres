@@ -1,12 +1,33 @@
+/* ------------------------------------------------------------------------
+ *
+ * exchange.c
+ *		This module contains the EXHCANGE custom node implementation
+ *
+ *		The EXCHANGE node implement intra- plan node tuples shuffling
+ *		between instances by a socket interface implemented by connection.c
+ *		module.
+ *		Connections each-by-each are established by EXCHANGE_Begin() and in
+ *		parallel worker initializer routine.
+ *		Connections are closed by EXCHANGE_End().
+ *		After receiving NULL slot from local storage EXCHANGE node sends char
+ *		'C' to the another. It is not closed connection immediately for
+ *		possible rescan() calling.
+ *
+ * Copyright (c) 2018, Postgres Professional
+ *
+ * ------------------------------------------------------------------------
+ */
+
 #include "postgres.h"
+#include "unistd.h"
+
+#include "access/hash.h"
+#include "nodes/makefuncs.h"
 
 #include "common.h"
 #include "connection.h"
 #include "exchange.h"
-#include "nodes/makefuncs.h"
 #include "pargres.h"
-
-#include "unistd.h"
 
 
 static CustomScanMethods	exchange_plan_methods;
@@ -455,6 +476,16 @@ fragmentation_fn_empty(int value, int nnodes, int mynum)
 	return mynum;
 }
 
+static int
+fragmentation_fn_hash(Datum value, int nnodes, int mynum)
+{
+	uint64 result;
+	void *k;
+	int keylen;
+
+	result = hash_any_extended(k, keylen, 0);
+	return result%nnodes;
+}
 fragmentation_fn_t
 frFuncs(fr_func_id fid)
 {

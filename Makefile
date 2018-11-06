@@ -5,7 +5,7 @@ EXTENSION = pargres
 EXTVERSION = 0.1
 PGFILEDESC = "Pargres - parallel query execution module [Prototype]"
 MODULES = pargres
-OBJS = pargres.o exchange.o distplan.o connection.o hooks_exec.o common.o $(WIN32RES)
+OBJS = pargres.o exchange.o connection.o hooks_exec.o common.o $(WIN32RES)
 # REGRESS = aqo_disabled aqo_controlled aqo_intelligent aqo_forced aqo_learn
 
 PG_CPPFLAGS = -I$(libpq_srcdir)

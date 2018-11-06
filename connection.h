@@ -1,7 +1,15 @@
-/*
- * connection.h
+/*-------------------------------------------------------------------------
  *
- *      Author: andrey
+ * connection.h
+ *	Network layer functions
+ *
+ * Copyright (c) 2018, PostgreSQL Global Development Group
+ * Author: Andrey Lepikhov <a.lepikhov@postgrespro.ru>
+ *
+ * IDENTIFICATION
+ *	contrib/pargres/connection.h
+ *
+ *-------------------------------------------------------------------------
  */
 
 #ifndef CONNECTION_H_

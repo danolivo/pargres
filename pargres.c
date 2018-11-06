@@ -1,3 +1,14 @@
+/* ------------------------------------------------------------------------
+ *
+ * pargres.c
+ *		This module sets planner hooks, initializes shared memory and
+ *		ParGRES-related data.
+ *
+ * Copyright (c) 2018, Postgres Professional
+ *
+ * ------------------------------------------------------------------------
+ */
+
 #include "postgres.h"
 
 #include "access/htup_details.h"

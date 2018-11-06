@@ -1,7 +1,15 @@
-/*
- * exchange.h
+/*-------------------------------------------------------------------------
  *
- *      Author: andrey
+ * exchange.h
+ *	Special custom node for tuples shuffling during parallel query execution.
+ *
+ * Copyright (c) 2018, PostgreSQL Global Development Group
+ * Author: Andrey Lepikhov <a.lepikhov@postgrespro.ru>
+ *
+ * IDENTIFICATION
+ *	contrib/pargres/exchange.h
+ *
+ *-------------------------------------------------------------------------
  */
 
 #ifndef EXCHANGE_H_

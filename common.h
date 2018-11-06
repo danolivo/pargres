@@ -1,7 +1,15 @@
-/*
- * common.h
+/*-------------------------------------------------------------------------
  *
- *      Author: andrey
+ * common.h
+ *	Common code for ParGRES extension
+ *
+ * Copyright (c) 2018, PostgreSQL Global Development Group
+ * Author: Andrey Lepikhov <a.lepikhov@postgrespro.ru>
+ *
+ * IDENTIFICATION
+ *	contrib/pargres/common.h
+ *
+ *-------------------------------------------------------------------------
  */
 
 #ifndef COMMON_H_

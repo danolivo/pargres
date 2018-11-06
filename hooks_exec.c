@@ -1,7 +1,11 @@
-/*
- * hooks_exec.c
+/* ------------------------------------------------------------------------
  *
- *      Author: andrey
+ * hooks_exec.c
+ *		Executor-related logic of the ParGRES extension.
+ *
+ * Copyright (c) 2018, Postgres Professional
+ *
+ * ------------------------------------------------------------------------
  */
 
 #include "postgres.h"

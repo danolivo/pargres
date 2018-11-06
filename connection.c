@@ -1,7 +1,12 @@
-/*
- * connection.c
+/* ------------------------------------------------------------------------
  *
- *      Author: andrey
+ * connection.c
+ *		This module contains implementation of EXCHANGE message passing
+ *		interface.
+ *
+ * Copyright (c) 2018, Postgres Professional
+ *
+ * ------------------------------------------------------------------------
  */
 
 #include "postgres.h"
@@ -180,14 +185,19 @@ ListenPort(int port, pgsocket *sock)
 	return actual_port_num;
 }
 
+/*
+ * Low-level routine to establish connection with server, defined by the pair
+ * (host, port).
+ * It ignore OS core signals (EINTR) and infinitely wait, while server set
+ * port to listen mode and accept the connection.
+ * The routine log another error messages and returns socket.
+ */
 pgsocket
 CONN_Connect(int port, in_addr_t host)
 {
 	pgsocket			sock;
 	struct sockaddr_in	addr;
 	int					res;
-//	struct hostent		*server;
-
 
 	sock = socket(AF_INET, SOCK_STREAM, 0);
 	if(sock < 0)

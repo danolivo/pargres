@@ -1,7 +1,11 @@
-/*
- * common.c
+/* ------------------------------------------------------------------------
  *
- *      Author: andrey
+ * common.c
+ *		Common code for ParGRES extension
+ *
+ * Copyright (c) 2018, Postgres Professional
+ *
+ * ------------------------------------------------------------------------
  */
 
 #include "postgres.h"
