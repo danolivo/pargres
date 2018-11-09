@@ -919,7 +919,7 @@ isLocalValue(PG_FUNCTION_ARGS)
 
 		relid = get_relname_relid(relname, get_pargres_schema());
 		rel = heap_open(relid, AccessShareLock);
-		atttypid = TupleDescAttr(rel->rd_att, frOpts.attno)->atttypid;
+		atttypid = TupleDescAttr(rel->rd_att, frOpts.attno-1)->atttypid;
 		heap_close(rel, AccessShareLock);
 
 		opclass = GetDefaultOpClass(atttypid, HASH_AM_OID);

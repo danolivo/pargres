@@ -113,6 +113,7 @@ EXCHANGE_Create_state(CustomScan *node)
 	/* Extract necessary variables */
 	state->frOpts.attno = intVal(list_nth(node->custom_private, 4));
 	state->frOpts.funcId = intVal(list_nth(node->custom_private, 5));
+
 	state->broadcast_mode = intVal(list_nth(node->custom_private, 2));
 	state->drop_duplicates = intVal(list_nth(node->custom_private, 3));
 	state->mynode = intVal(list_nth(node->custom_private, 1));
@@ -153,7 +154,7 @@ EXCHANGE_Begin(CustomScanState *node, EState *estate, int eflags)
 						opcintype;
 
 
-		atttypid = TupleDescAttr(tupDesc, state->frOpts.attno)->atttypid;
+		atttypid = TupleDescAttr(tupDesc, state->frOpts.attno-1)->atttypid;
 		opclass = GetDefaultOpClass(atttypid, HASH_AM_OID);
 		opcfamily = get_opclass_family(opclass);
 		opcintype = get_opclass_input_type(opclass);
@@ -259,7 +260,6 @@ EXCHANGE_Execute(CustomScanState *node)
 
 			if (TupIsNull(slot))
 			{
-//				elog(LOG, "Launch CONN_Exchange_close, num=%d", state->number);
 				CONN_Exchange_close(&state->conn);
 				state->LocalStorageIsActive = false;
 			} else
@@ -522,11 +522,12 @@ get_tuple_node(fr_func_id fid, Datum value, int mynode, int nnodes,
 		return fragmentation_fn_empty(0, mynode, nnodes);
 	case FR_FUNC_HASH:
 	{
-		int val = DatumGetInt32(value);
+//		int val = DatumGetInt32(value);
 		int res;
+//		int a = 1;
 		Assert(data != NULL);
 		res = DatumGetUInt64(FunctionCall2((FmgrInfo *)data, value,
-												UInt64GetDatum(0))) % nnodes;
+												0)) % nnodes;
 //		elog(LOG, "node=%d val=%d res=%d", mynode, val, res);
 		return res;
 	}
