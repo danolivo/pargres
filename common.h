@@ -40,6 +40,7 @@ extern int CoordNode;
 extern bool PargresInitialized;
 
 
+extern Oid get_pargres_schema(void);
 extern void STACK_Init(PortStack *stack, int range_min, int size);
 int STACK_Pop(PortStack *stack);
 void STACK_Push(PortStack *stack, int value);

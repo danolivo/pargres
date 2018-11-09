@@ -11,9 +11,13 @@
 
 #include "postgres.h"
 
+#include "access/hash.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_opclass.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
 #include "commands/extension.h"
 #include "libpq-fe.h"
 #include "miscadmin.h"
@@ -25,6 +29,8 @@
 #include "storage/lmgr.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
 #include "utils/snapmgr.h"
 
 #include "unistd.h"
@@ -617,7 +623,7 @@ HOOK_Utility_injection(PlannedStmt *pstmt,
 	{
 	case T_CreateStmt: /* CREATE TABLE */
 		create_table_frag(((CreateStmt *)parsetree)->relation->relname, 1,
-						  FR_FUNC_DEFAULT);
+						  FR_FUNC_HASH);
 		break;
 	default:
 		break;
@@ -889,10 +895,9 @@ Datum
 isLocalValue(PG_FUNCTION_ARGS)
 {
 	char			*relname = TextDatumGetCString(PG_GETARG_DATUM(0));
-	int				value = PG_GETARG_INT32(1);
-	bool			result;
 	fr_options_t	frOpts;
-	fragmentation_fn_t	func;
+	int				destnode;
+	void			*data;
 
 	if (nfrRelations == 0)
 		load_description_frag();
@@ -900,9 +905,37 @@ isLocalValue(PG_FUNCTION_ARGS)
 		PG_RETURN_BOOL(true);
 
 	frOpts = getRelFrag(relname);
-	func = frFuncs(frOpts.funcId);
 
-	result = (func(value, node_number, nodes_at_cluster) == node_number);
+	if (frOpts.funcId == FR_FUNC_HASH)
+	{
+		Oid				atttypid;
+		Oid				opclass;
+		Oid				funcid;
+		FmgrInfo		*hashfunction = palloc0(sizeof(FmgrInfo));
+		Oid				relid;
+		Relation		rel;
+		Oid				opcfamily,
+						opcintype;
 
-	PG_RETURN_BOOL(result);
+		relid = get_relname_relid(relname, get_pargres_schema());
+		rel = heap_open(relid, AccessShareLock);
+		atttypid = TupleDescAttr(rel->rd_att, frOpts.attno)->atttypid;
+		heap_close(rel, AccessShareLock);
+
+		opclass = GetDefaultOpClass(atttypid, HASH_AM_OID);
+		opcfamily = get_opclass_family(opclass);
+		opcintype = get_opclass_input_type(opclass);
+		funcid = get_opfamily_proc(opcfamily, opcintype, opcintype,
+								   	   	   	   	   	   	   HASHEXTENDED_PROC);
+
+		fmgr_info(funcid, hashfunction);
+		data = hashfunction;
+	}
+	else
+		data = NULL;
+
+	destnode = get_tuple_node(frOpts.funcId, PG_GETARG_DATUM(1),
+							  node_number, nodes_at_cluster, data);
+
+	PG_RETURN_BOOL(destnode == node_number);
 }

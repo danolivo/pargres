@@ -434,7 +434,7 @@ CONN_Init_exchange(ConnInfo *pool, ex_conn_t *exconn, int mynum, int nnodes)
 	pgsocket	*incoming_socks = palloc((nnodes - 1) * sizeof(pgsocket));
 
 	Assert(pool != NULL);
-	elog(LOG, "Start CONN_Init_exchange");
+//	elog(LOG, "Start CONN_Init_exchange");
 	exconn->rsock = palloc(sizeof(pgsocket) * nnodes);
 	exconn->rsIsOpened = palloc(sizeof(pgsocket) * nnodes);
 	exconn->wsock = palloc(sizeof(pgsocket) * nnodes);
@@ -708,7 +708,7 @@ CONN_Recv_tuple(pgsocket *socks, bool *isopened,  int *res)
 				}
 				else if (*res == 1)
 				{
-					elog(LOG, "READ SOCK Close: %d (%d)", socks[i], i);
+//					elog(LOG, "READ SOCK Close: %d (%d)", socks[i], i);
 					isopened[i] = false;
 					continue;
 				}

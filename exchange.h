@@ -19,13 +19,13 @@
 #include "nodes/extensible.h"
 #include "optimizer/planner.h"
 
-typedef int (*fragmentation_fn_t) (int value, int mynum, int nnodes);
 
 typedef enum
 {
 	FR_FUNC_NINITIALIZED = 0,
 	FR_FUNC_DEFAULT,
-	FR_FUNC_GATHER
+	FR_FUNC_GATHER,
+	FR_FUNC_HASH
 } fr_func_id;
 
 typedef struct
@@ -49,6 +49,7 @@ typedef struct
 	int				LocalStorageTuple;
 	int				NetworkStorageTuple;
 	int				number;
+	void			*data;
 } ExchangeState;
 
 extern void EXCHANGE_Init_methods(void);
@@ -56,6 +57,7 @@ extern Plan *make_exchange(Plan *subplan, fr_options_t frOpts,
 							bool drop_duplicates,
 							bool broadcast_mode,
 							int mynode, int nnodes);
-extern fragmentation_fn_t frFuncs(fr_func_id fid);
+extern int get_tuple_node(fr_func_id fid, Datum value, int mynode, int nnodes,
+						  void *data);
 
 #endif /* EXCHANGE_H_ */

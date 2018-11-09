@@ -22,7 +22,13 @@
 #include "unistd.h"
 
 #include "access/hash.h"
+#include "access/htup_details.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_opclass.h"
+#include "commands/defrem.h"
 #include "nodes/makefuncs.h"
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
 #include "common.h"
 #include "connection.h"
@@ -136,6 +142,32 @@ EXCHANGE_Begin(CustomScanState *node, EState *estate, int eflags)
 	node->ss.ss_ScanTupleSlot = ExecInitExtraTupleSlot(estate, tupDesc);
 	node->ss.ps.ps_ResultTupleSlot = ExecInitExtraTupleSlot(estate, tupDesc);
 
+	/* If we use hash function, we need to prepare info for fmgr */
+	if (state->frOpts.funcId == FR_FUNC_HASH)
+	{
+		Oid				atttypid;
+		Oid				opclass;
+		Oid				funcid;
+		FmgrInfo		*hashfunction = palloc0(sizeof(FmgrInfo));
+		Oid				opcfamily,
+						opcintype;
+
+
+		atttypid = TupleDescAttr(tupDesc, state->frOpts.attno)->atttypid;
+		opclass = GetDefaultOpClass(atttypid, HASH_AM_OID);
+		opcfamily = get_opclass_family(opclass);
+		opcintype = get_opclass_input_type(opclass);
+		funcid = get_opfamily_proc(opcfamily,
+								   opcintype,
+								   opcintype,
+								   HASHEXTENDED_PROC);
+
+		fmgr_info(funcid, hashfunction);
+		state->data = hashfunction;
+	}
+	else
+		state->data = NULL;
+
 	state->NetworkIsActive = true;
 	state->LocalStorageIsActive = true;
 	state->NetworkStorageTuple = 0;
@@ -209,9 +241,6 @@ EXCHANGE_Execute(CustomScanState *node)
 
 	for (;;)
 	{
-		fragmentation_fn_t	frfunc;
-		int					val;
-
 		if (state->NetworkIsActive)
 		{
 			slot = GetTupleFromNetwork(state, node->ss.ss_ScanTupleSlot,
@@ -230,7 +259,7 @@ EXCHANGE_Execute(CustomScanState *node)
 
 			if (TupIsNull(slot))
 			{
-				elog(LOG, "Launch CONN_Exchange_close, num=%d", state->number);
+//				elog(LOG, "Launch CONN_Exchange_close, num=%d", state->number);
 				CONN_Exchange_close(&state->conn);
 				state->LocalStorageIsActive = false;
 			} else
@@ -282,10 +311,9 @@ EXCHANGE_Execute(CustomScanState *node)
 			value = slot_getattr(slot, state->frOpts.attno, &isnull);
 			Assert(!isnull);
 
-			frfunc = frFuncs(state->frOpts.funcId);
-			val = DatumGetInt32(value);
-
-			destnode = frfunc(val, state->mynode, state->nnodes);
+			destnode = get_tuple_node(state->frOpts.funcId, value,
+									  state->mynode, state->nnodes,
+									  state->data);
 		}
 
 		if (destnode == state->mynode)
@@ -476,32 +504,36 @@ fragmentation_fn_empty(int value, int nnodes, int mynum)
 	return mynum;
 }
 
-static int
-fragmentation_fn_hash(Datum value, int nnodes, int mynum)
-{
-	uint64 result;
-	void *k;
-	int keylen;
-
-	result = hash_any_extended(k, keylen, 0);
-	return result%nnodes;
-}
-fragmentation_fn_t
-frFuncs(fr_func_id fid)
+int
+get_tuple_node(fr_func_id fid, Datum value, int mynode, int nnodes,
+			   void *data)
 {
 	switch (fid)
 	{
 	case FR_FUNC_DEFAULT:
-		return fragmentation_fn_default;
+	{
+		int val = DatumGetInt32(value);
+		return fragmentation_fn_default(val, mynode, nnodes);
+	}
 	case FR_FUNC_GATHER:
-		return fragmentation_fn_gather;
+		return fragmentation_fn_gather(0, 0, 1);
 
 	case FR_FUNC_NINITIALIZED:
-		return fragmentation_fn_empty;
+		return fragmentation_fn_empty(0, mynode, nnodes);
+	case FR_FUNC_HASH:
+	{
+		int val = DatumGetInt32(value);
+		int res;
+		Assert(data != NULL);
+		res = DatumGetUInt64(FunctionCall2((FmgrInfo *)data, value,
+												UInt64GetDatum(0))) % nnodes;
+//		elog(LOG, "node=%d val=%d res=%d", mynode, val, res);
+		return res;
+	}
 	default:
 		elog(ERROR, "Undefined function");
 	}
-	return NULL;
+	return -1;
 }
 
 static Size
